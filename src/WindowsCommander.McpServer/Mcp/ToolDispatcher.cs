@@ -346,7 +346,7 @@ public sealed class ToolDispatcher
         if (ComputerUseTools.Contains(name))
         {
             notifier.Notify();
-            controlIndicatorService.SignalActivity(DescribeActivity(name), risk == RiskLevel.High);
+            controlIndicatorService.SignalActivity(DescribeActivity(name), risk == RiskLevel.High, ResolveGlowBounds(name, arguments));
         }
 
         try
@@ -407,6 +407,36 @@ public sealed class ToolDispatcher
             "manage_process" => "managing a process",
             _ => toolName.Replace('_', ' ')
         };
+    }
+
+    // Frames the activity glow on exactly what a capture targets: the captured
+    // screen, or the captured window's border. Returns null for every other
+    // tool and for any capture that spans the whole virtual desktop or whose
+    // target cannot be resolved, so the glow falls back to framing all screens.
+    private RectBounds? ResolveGlowBounds(string name, JsonElement? arguments)
+    {
+        try
+        {
+            switch (name)
+            {
+                case "capture_screen":
+                    return visionService.ResolveCaptureGlowBounds(GetRequiredString(arguments, "target"), GetLong(arguments, "hwnd"));
+                case "capture_screen_region":
+                    var width = GetRequiredInt(arguments, "width");
+                    var height = GetRequiredInt(arguments, "height");
+                    return width > 0 && height > 0
+                        ? new RectBounds(GetRequiredInt(arguments, "x"), GetRequiredInt(arguments, "y"), width, height)
+                        : null;
+                default:
+                    return null;
+            }
+        }
+        catch
+        {
+            // The glow is a courtesy; a missing/invalid argument must not stop
+            // the tool. Fall back to the default all-screens glow.
+            return null;
+        }
     }
 
     private static object ToToolResult(object result)

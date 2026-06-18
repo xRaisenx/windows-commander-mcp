@@ -30,8 +30,9 @@ public sealed class ControlIndicatorService : IControlIndicatorService
     private static readonly TimeSpan ActivityHold = TimeSpan.FromMilliseconds(2000);
 
     // How long the faint idle border lingers with no activity before the glow
-    // is hidden entirely.
-    private static readonly TimeSpan SessionIdleHold = TimeSpan.FromSeconds(30);
+    // is hidden entirely. Kept short so the frame clears promptly once the
+    // automation stops rather than hanging around the desktop.
+    private static readonly TimeSpan SessionIdleHold = TimeSpan.FromSeconds(3);
 
     private readonly object syncRoot = new();
 
@@ -113,7 +114,7 @@ public sealed class ControlIndicatorService : IControlIndicatorService
         return status;
     }
 
-    public void SignalActivity(string message, bool elevated)
+    public void SignalActivity(string message, bool elevated, RectBounds? bounds = null)
     {
         // The activity glow must never disrupt the tool call that triggered it.
         try
@@ -142,7 +143,7 @@ public sealed class ControlIndicatorService : IControlIndicatorService
             // High-risk actions glow in a warning colour: the cue then says
             // "automation is doing something risky", not merely "active".
             var overlayConfig = elevated ? config with { BorderColor = "Orange" } : config;
-            ShowOverlay(queue, RectanglesFor(null), overlayConfig, ActivityPhase.Active);
+            ShowOverlay(queue, RectanglesFor(bounds), overlayConfig, ActivityPhase.Active);
 
             lock (syncRoot)
             {
@@ -250,10 +251,11 @@ public sealed class ControlIndicatorService : IControlIndicatorService
         return new ConfirmationResult(title, message, riskLevel, decision, DateTimeOffset.UtcNow);
     }
 
-    // Resolves which rectangles to glow. An explicit bounds is shown as a single
-    // rectangle; otherwise every screen is framed individually so each gets a
-    // correctly sized glow regardless of its own resolution or position — a
-    // single virtual-desktop rectangle would only fit the tallest monitor.
+    // Resolves which rectangles to glow. An explicit bounds is framed as a
+    // single rectangle (the captured screen, or the captured window's border);
+    // a null bounds falls back to framing every screen individually so each
+    // gets a correctly sized glow regardless of its resolution — a single
+    // virtual-desktop rectangle would only fit the tallest monitor.
     private static IReadOnlyList<RectBounds> RectanglesFor(RectBounds? explicitBounds)
     {
         if (explicitBounds is not null)

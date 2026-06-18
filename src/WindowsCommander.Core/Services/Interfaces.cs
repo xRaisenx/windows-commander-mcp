@@ -156,6 +156,16 @@ public interface IVisionService
     Task<OcrResult> OcrScreenAsync(string target, long? windowHandle, RectBounds? region);
 
     VisualDetectionResult DetectVisualElements(string target, long? windowHandle, RectBounds? region, IReadOnlyList<string>? elementTypes);
+
+    /// <summary>
+    /// The rectangle a <c>capture_screen</c> call covers, used to frame the
+    /// activity glow on exactly what is captured. Returns the window's border
+    /// for a window/active_window target and the screen bounds for a single
+    /// monitor; returns null when the capture spans the whole virtual desktop
+    /// (full_screen, or an active_window that could not be resolved) so the
+    /// caller frames every monitor instead of one oversized rectangle.
+    /// </summary>
+    RectBounds? ResolveCaptureGlowBounds(string target, long? windowHandle);
 }
 
 public interface IUiAutomationService
@@ -188,8 +198,10 @@ public interface IControlIndicatorService
     /// then settles to a faint persistent border (the session is still live)
     /// and only fully hides after a longer idle. <paramref name="elevated"/>
     /// switches the glow to a warning colour for high-risk actions.
+    /// <paramref name="bounds"/> frames a specific rectangle (e.g. the screen
+    /// or window a capture targets); a null bounds frames every monitor.
     /// </summary>
-    void SignalActivity(string message, bool elevated);
+    void SignalActivity(string message, bool elevated, RectBounds? bounds = null);
 
     ConfirmationResult RequestUserConfirmation(string title, string message, string riskLevel, int? timeoutMs);
 }

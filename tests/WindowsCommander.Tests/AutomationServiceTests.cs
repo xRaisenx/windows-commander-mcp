@@ -24,6 +24,27 @@ public class AutomationServiceTests
     }
 
     [Fact]
+    public void VisionService_ResolveCaptureGlowBounds_FullScreenFallsBackToAllScreens()
+    {
+        var service = new VisionService();
+
+        // full_screen spans the whole virtual desktop; the glow should frame
+        // every monitor (null) rather than one oversized rectangle.
+        Assert.Null(service.ResolveCaptureGlowBounds("full_screen", null));
+    }
+
+    [Fact]
+    public void VisionService_ResolveCaptureGlowBounds_PrimaryScreenFramesThatScreen()
+    {
+        var service = new VisionService();
+
+        var bounds = service.ResolveCaptureGlowBounds("primary_screen", null);
+
+        Assert.NotNull(bounds);
+        Assert.True(bounds!.Width > 0 && bounds.Height > 0);
+    }
+
+    [Fact]
     public void InputService_MouseActionRejectsMissingCoordinates()
     {
         var service = new InputService();

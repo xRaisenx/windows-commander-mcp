@@ -177,6 +177,30 @@ public sealed class VisionService : IVisionService
         return new VisualDetectionResult(candidates, resolvedRegion, DateTimeOffset.UtcNow);
     }
 
+    public RectBounds? ResolveCaptureGlowBounds(string target, long? windowHandle)
+    {
+        // full_screen grabs the whole virtual desktop; let the caller frame
+        // each monitor individually rather than one oversized rectangle.
+        if (target.Equals("full_screen", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var region = ResolveCaptureRegion(target, windowHandle);
+
+        // active_window falls back to full_screen when the foreground window
+        // cannot be resolved; treat that virtual-desktop-sized result as null
+        // too so the glow does not stretch across every screen as one rect.
+        var virtualScreen = SystemInformation.VirtualScreen;
+        if (region.X == virtualScreen.X && region.Y == virtualScreen.Y
+            && region.Width == virtualScreen.Width && region.Height == virtualScreen.Height)
+        {
+            return null;
+        }
+
+        return region;
+    }
+
     private static ScreenCaptureResult CaptureRegion(RectBounds region, string? monitorId, int? maxDimension)
     {
         using var bitmap = new System.Drawing.Bitmap(region.Width, region.Height);

@@ -116,10 +116,15 @@ match, so `process_name: "Notepad"` also matches `notepad++`.
 - **Computer-use feedback**: `ToolDispatcher` fires a sound
   (`ComputerUseNotifier`) and a pulsing screen-edge glow
   (`ControlIndicatorService.SignalActivity`) for every computer-use tool. The
-  glow draws **one window per monitor** so each screen is framed at its own
-  resolution; it never activates (`ShowActivated = false`) so it cannot steal
-  focus. It settles to a faint idle border 2 s after the last call and hides
-  after a further 30 s idle (see *Activity-chip queue* in Status).
+  glow frames **one window per monitor** (each screen sized to its own
+  resolution); a capture tool instead frames **just what it captures** — the
+  captured screen, or the captured window's border (`SignalActivity`'s
+  `bounds`, resolved by `IVisionService.ResolveCaptureGlowBounds` /
+  `ResolveGlowBounds`). A `full_screen` capture, or any unresolvable target,
+  falls back to framing every monitor. It never activates
+  (`ShowActivated = false`) so it cannot steal focus. It settles to a faint idle
+  border 2 s after the last call and hides after a further 3 s idle (see
+  *Activity-chip queue* in Status).
 - **WPF/WinForms threading**: clipboard and UI overlays need STA threads;
   see `RunOnStaThread` and the overlay dispatcher thread.
 
@@ -130,13 +135,14 @@ match, so `process_name: "Notepad"` also matches `notepad++`.
 - `capture_screen` returns an MCP `image` content type, downscaled.
 - `focus_window` robust foreground activation (verified).
 - `type_text` via clipboard paste, all-formats clipboard preservation (verified).
-- Computer-use sound + per-monitor glowing border indicator.
+- Computer-use sound + per-monitor glowing border indicator; capture tools
+  frame only the captured screen / window.
 - **Risk gating**: `RiskPolicyService` is wired into `ToolDispatcher`. High-risk
   tools (process kills, file writes/deletes, env changes, script execution)
   require a local confirmation dialog before they run; the audit log records
   the risk level and any blocked attempt. See *Safety / unattended mode* below.
 - **Indicator phases**: the activity glow shows a bright pulse during an
-  action, settles to a faint persistent border for 30 s (session still
+  action, settles to a faint persistent border for 3 s (session still
   connected), then hides. High-risk actions glow orange with a "⚠" label.
 - **Activity-chip queue**: recent actions render as a horizontal queue of
   labelled chips ("⚡ typing text") along the glow's top edge, newest
