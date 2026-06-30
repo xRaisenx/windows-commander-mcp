@@ -30,6 +30,10 @@ public sealed class ToolDispatcher
     private readonly bool requireConfirmation;
     private readonly ComputerUseNotifier notifier = new();
 
+    // Pause after raising a capture target to the foreground so the desktop
+    // compositor paints it before the capture reads the screen pixels.
+    private const int CaptureForegroundSettleMs = 150;
+
     // Tools that actively drive the desktop (mouse, keyboard, windows, UI,
     // screen capture). A call to one of these plays the computer-use chime.
     private static readonly HashSet<string> ComputerUseTools = new(StringComparer.Ordinal)
@@ -161,7 +165,8 @@ public sealed class ToolDispatcher
                 Tool("capture_screen", "Captures pixels from the screen and returns a PNG image.",
                     Str("target", "What to capture: 'full_screen', 'active_window', or a numeric window handle.", required: true),
                     Int("hwnd", "Explicit window handle to capture (overrides target)."),
-                    Int("max_dimension", "Cap the longest image side in pixels; the capture is downscaled to fit (default 1400).")),
+                    Int("max_dimension", "Cap the longest image side in pixels; the capture is downscaled to fit (default 1400)."),
+                    Bool("bring_to_front", "When the target is a specific window (hwnd or a numeric target), raise it to the foreground before capturing so an occluded window is not photographed behind whatever covers it (default true). No effect for screen or active_window targets. Pass false to capture a background window without changing focus or z-order.")),
                 Tool("capture_screen_region", "Captures a rectangular screen region as a PNG image.",
                     Int("x", "Region left position in virtual-screen pixels.", required: true),
                     Int("y", "Region top position in virtual-screen pixels.", required: true),
@@ -198,7 +203,8 @@ public sealed class ToolDispatcher
                 Tool("ocr_screen", "Extracts local visible text metadata from a screen/window region.",
                     Str("target", "What to read: 'full_screen', 'active_window', or a numeric window handle.", required: true),
                     Int("hwnd", "Explicit window handle to read."),
-                    RectParam("region", "Optional sub-region to limit the read.")),
+                    RectParam("region", "Optional sub-region to limit the read."),
+                    Bool("bring_to_front", "When the target is a specific window (hwnd or a numeric target), raise it to the foreground before reading so an occluded window is not read behind whatever covers it (default true). No effect for screen or active_window targets. Pass false to read a background window without changing focus or z-order.")),
                 Tool("detect_visual_elements", "Detects local visual candidates from windows/UI metadata.",
                     Str("target", "What to scan: 'full_screen', 'active_window', or a numeric window handle.", required: true),
                     Int("hwnd", "Explicit window handle to scan."),
@@ -439,6 +445,40 @@ public sealed class ToolDispatcher
         }
     }
 
+    // capture_screen / ocr_screen read whatever pixels currently sit at the
+    // target window's rectangle, so an occluded window is photographed behind
+    // whatever covers it. When the target names a specific window, raise it to
+    // the foreground first (reusing the same activation focus_window relies on)
+    // and let the compositor repaint before the pixels are read. Callers can
+    // pass bring_to_front:false to capture a background window undisturbed.
+    private async Task MaybeBringCaptureTargetToFrontAsync(string name, JsonElement? arguments, CancellationToken cancellationToken)
+    {
+        if (name is not ("capture_screen" or "ocr_screen"))
+        {
+            return;
+        }
+
+        if (!(GetBool(arguments, "bring_to_front") ?? true))
+        {
+            return;
+        }
+
+        var handle = visionService.TryResolveCaptureWindowHandle(
+            GetRequiredString(arguments, "target"),
+            GetLong(arguments, "hwnd"));
+        if (handle is null)
+        {
+            return;
+        }
+
+        windowService.FocusWindow(handle.Value);
+
+        // ForceForeground returns once the window is the foreground window, but
+        // the desktop compositor has not necessarily painted the freshly-raised
+        // window yet. A short settle delay avoids capturing a stale frame.
+        await Task.Delay(CaptureForegroundSettleMs, cancellationToken);
+    }
+
     private static object ToToolResult(object result)
     {
         // Screenshots are returned as MCP image content so clients can view the
@@ -481,6 +521,8 @@ public sealed class ToolDispatcher
 
     private async Task<object> DispatchAsync(string name, JsonElement? arguments, CancellationToken cancellationToken)
     {
+        await MaybeBringCaptureTargetToFrontAsync(name, arguments, cancellationToken);
+
         return name switch
         {
             "list_processes" => DispatchProcessTool(name, arguments, cancellationToken),

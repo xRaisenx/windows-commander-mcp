@@ -45,6 +45,31 @@ public class AutomationServiceTests
     }
 
     [Fact]
+    public void VisionService_TryResolveCaptureWindowHandle_ReturnsHandleForWindowTargets()
+    {
+        var service = new VisionService();
+
+        // An explicit hwnd wins over target, mirroring how the capture itself
+        // resolves pixels.
+        Assert.Equal(4242, service.TryResolveCaptureWindowHandle("active_window", 4242));
+        // A bare numeric target names a window.
+        Assert.Equal(1234, service.TryResolveCaptureWindowHandle("1234", null));
+    }
+
+    [Fact]
+    public void VisionService_TryResolveCaptureWindowHandle_ReturnsNullForScreenAndActiveWindowTargets()
+    {
+        var service = new VisionService();
+
+        // Screen targets name no single window; active_window is already the
+        // foreground. Nothing to raise, so no handle is resolved.
+        Assert.Null(service.TryResolveCaptureWindowHandle("full_screen", null));
+        Assert.Null(service.TryResolveCaptureWindowHandle("primary_screen", null));
+        Assert.Null(service.TryResolveCaptureWindowHandle("screen-2", null));
+        Assert.Null(service.TryResolveCaptureWindowHandle("active_window", null));
+    }
+
+    [Fact]
     public void InputService_MouseActionRejectsMissingCoordinates()
     {
         var service = new InputService();

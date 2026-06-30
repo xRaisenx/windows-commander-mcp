@@ -201,6 +201,25 @@ public sealed class VisionService : IVisionService
         return region;
     }
 
+    public long? TryResolveCaptureWindowHandle(string target, long? windowHandle)
+    {
+        // An explicit hwnd wins, exactly as ResolveCaptureRegion resolves the
+        // pixels we are about to grab; a bare numeric target names a window too.
+        if (windowHandle is not null)
+        {
+            return windowHandle;
+        }
+
+        if (long.TryParse(target, out var parsed))
+        {
+            return parsed;
+        }
+
+        // full_screen / primary_screen / screen-N name no single window, and
+        // active_window is already the foreground — nothing to raise.
+        return null;
+    }
+
     private static ScreenCaptureResult CaptureRegion(RectBounds region, string? monitorId, int? maxDimension)
     {
         using var bitmap = new System.Drawing.Bitmap(region.Width, region.Height);

@@ -142,6 +142,50 @@ try {
         { param($p) $p.bounds.width -eq 900 -and $p.bounds.height -eq 620 } | Out-Null
     Test-Tool $proc 'focus_window' @{ window_handle = $hwnd } -Label 're-focus' { param($p) $p.completed } | Out-Null
 
+    Write-Host "--- capture bring-to-front ---------------------------------" -ForegroundColor Yellow
+
+    # Helper: re-read the target window's record so we can assert its state.
+    function Get-TargetWindow {
+        param([System.Diagnostics.Process]$Proc, [long]$Handle)
+        try {
+            $fw = Invoke-Rpc -Proc $Proc -Method 'tools/call' -Params @{ name = 'find_window'; arguments = @{ class_name = 'Notepad' } }
+            return (Get-Txt $fw | ConvertFrom-Json) | Where-Object { [int64]$_.hwnd -eq [int64]$Handle } | Select-Object -First 1
+        } catch { return $null }
+    }
+
+    function Add-Result {
+        param([string]$Tool, [bool]$Ok, [string]$Detail)
+        $st = if ($Ok) { 'PASS' } else { 'FAIL' }
+        $script:results.Add([pscustomobject]@{ Tool = $Tool; Status = $st; Detail = $Detail })
+        Write-Host ("  {0,-32} {1,-4} {2}" -f $Tool, $st, $Detail) -ForegroundColor $(if ($Ok) { 'Green' } else { 'Red' })
+    }
+
+    # Default (bring_to_front omitted => true): minimizing the target then
+    # capturing it by handle must raise/restore it first, so an occluded or
+    # minimized window is not photographed behind whatever covers it. Verify an
+    # image came back AND the window ended up un-minimized.
+    Test-Tool $proc 'set_window_state' @{ window_handle = $hwnd; state = 'minimize' } -Label 'pre-min' { param($p) $p.completed } | Out-Null
+    Start-Sleep -Milliseconds 300
+    $capResp = Test-Tool $proc 'capture_screen' @{ target = "$hwnd" } -Label 'default raises' { param($p) $true }
+    $hasImage = [bool]($capResp.result.content | Where-Object { $_.type -eq 'image' -and $_.data })
+    $after = Get-TargetWindow -Proc $proc -Handle $hwnd
+    $raised = $hasImage -and $after -and (-not $after.isMinimized)
+    Add-Result 'capture_screen (raise verify)' $raised "hasImage=$hasImage minimized=$($after.isMinimized)"
+
+    # Opt out: bring_to_front=false must NOT raise the window, so a minimized
+    # target stays minimized. (We assert the window state directly; the capture
+    # of an off-screen window is allowed to return whatever pixels are there.)
+    Test-Tool $proc 'set_window_state' @{ window_handle = $hwnd; state = 'minimize' } -Label 'pre-min2' { param($p) $p.completed } | Out-Null
+    Start-Sleep -Milliseconds 300
+    try { Invoke-Rpc -Proc $proc -Method 'tools/call' -Params @{ name = 'capture_screen'; arguments = @{ target = "$hwnd"; bring_to_front = $false } } | Out-Null } catch { }
+    $afterOptOut = Get-TargetWindow -Proc $proc -Handle $hwnd
+    $stayedMin = [bool]($afterOptOut -and $afterOptOut.isMinimized)
+    Add-Result 'capture_screen (opt-out no raise)' $stayedMin "minimized=$($afterOptOut.isMinimized)"
+
+    # Restore + focus the target so the input-injection section operates on it.
+    Test-Tool $proc 'set_window_state' @{ window_handle = $hwnd; state = 'restore' } -Label 'post-restore' { param($p) $p.completed } | Out-Null
+    Test-Tool $proc 'focus_window' @{ window_handle = $hwnd } -Label 'post-focus' { param($p) $p.completed } | Out-Null
+
     Write-Host "--- input injection ----------------------------------------" -ForegroundColor Yellow
     Test-Tool $proc 'set_cursor_position' @{ x = 400; y = 400 } { param($p) $p.completed } | Out-Null
     $cur = Test-Tool $proc 'get_cursor_position' @{} `

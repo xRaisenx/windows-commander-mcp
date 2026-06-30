@@ -150,8 +150,10 @@ match, so `process_name: "Notepad"` also matches `notepad++`.
   caught mid-render shows fewer chips rather than one label misattributed to
   the wrong action.
 - `smoke-mcp.ps1`: 35 read-only checks verified against a live desktop.
-- `mutate-mcp.ps1`: 25 mutating checks verified (window state, input
-  injection, UI Automation actions, file writes, env vars, process control).
+- `mutate-mcp.ps1`: mutating checks verified (window state, input
+  injection, UI Automation actions, file writes, env vars, process control),
+  plus a capture *bring-to-front* check: a minimized target is raised before a
+  default `capture_screen`, and stays minimized under `bring_to_front: false`.
 
 ## Safety / unattended mode
 
@@ -206,6 +208,15 @@ covered by `smoke-mcp.ps1`'s "agent-efficiency features" section:
   to an unreadable blur. Use `primary_screen` or `screen-N` (1-based, matches
   the `monitorId` scheme) to capture one monitor; `active_window` resolves the
   real foreground window.
+- `capture_screen` / `ocr_screen` `bring_to_front` (default `true`): when the
+  target names a *specific window* (a numeric `target` or an explicit `hwnd`),
+  the dispatcher raises that window to the foreground (via the same
+  `WindowService.FocusWindow` activation, then a short settle delay) before the
+  pixels are read — otherwise `CopyFromScreen` photographs whatever sits on top
+  of an occluded/minimized target. No effect for screen targets or
+  `active_window` (already foreground); `TryResolveCaptureWindowHandle` returns
+  null for those. Pass `bring_to_front: false` to read a background window
+  without disturbing focus or z-order. `mutate-mcp.ps1` covers both paths.
 
 ## Conventions
 

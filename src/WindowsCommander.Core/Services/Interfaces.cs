@@ -166,6 +166,18 @@ public interface IVisionService
     /// caller frames every monitor instead of one oversized rectangle.
     /// </summary>
     RectBounds? ResolveCaptureGlowBounds(string target, long? windowHandle);
+
+    /// <summary>
+    /// The native window handle a capture/OCR call grabs pixels from, when the
+    /// target names a specific window: an explicit <paramref name="windowHandle"/>
+    /// (which wins, matching the capture itself) or a numeric <paramref name="target"/>.
+    /// Returns null for screen targets (full_screen, primary_screen, screen-N)
+    /// and for active_window (already the foreground), i.e. the cases where there
+    /// is no occluded window worth raising. Used to bring the target to the
+    /// foreground before capture so an occluded window is not photographed
+    /// behind whatever sits on top of it.
+    /// </summary>
+    long? TryResolveCaptureWindowHandle(string target, long? windowHandle);
 }
 
 public interface IUiAutomationService
