@@ -111,6 +111,41 @@ public sealed class WindowService : IWindowService
         }
     }
 
+    public WindowActionResult RaiseWindowForCapture(long windowHandle)
+    {
+        var handle = new IntPtr(windowHandle);
+        var completed = RaiseWithoutActivating(handle);
+        return new WindowActionResult(windowHandle, "raise_for_capture", completed, GetWindowBounds(handle), null);
+    }
+
+    // Brings a window to the top of the Z order so a screen capture no longer
+    // photographs it behind whatever covers it, WITHOUT activating it or moving
+    // the foreground/keyboard focus. This is the deliberate opposite of
+    // ForceForeground: the user keeps typing into whatever they were using while
+    // the target is merely re-stacked for the grab.
+    private static bool RaiseWithoutActivating(IntPtr handle)
+    {
+        const int swShowNoActivate = 4;
+        const uint swpNoSize = 0x0001;
+        const uint swpNoMove = 0x0002;
+        const uint swpNoActivate = 0x0010;
+        const uint swpShowWindow = 0x0040;
+
+        // A minimized window has nothing on screen to photograph. Restore it to
+        // its previous size/position, but with SW_SHOWNOACTIVATE so it does not
+        // steal activation the way the SW_RESTORE in ForceForeground would.
+        if (NativeMethods.IsIconic(handle))
+        {
+            NativeMethods.ShowWindow(handle, swShowNoActivate);
+        }
+
+        // HWND_TOP (IntPtr.Zero) with SWP_NOACTIVATE lifts the window to the top
+        // of the Z order while leaving the foreground window exactly where it is,
+        // so keyboard focus never moves to the captured target.
+        return NativeMethods.SetWindowPos(handle, IntPtr.Zero, 0, 0, 0, 0,
+            swpNoMove | swpNoSize | swpNoActivate | swpShowWindow);
+    }
+
     public WindowActionResult MoveResizeWindow(long windowHandle, int? x, int? y, int? width, int? height)
     {
         var handle = new IntPtr(windowHandle);

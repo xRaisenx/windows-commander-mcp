@@ -19,6 +19,12 @@ public interface IWindowService
 
     WindowActionResult FocusWindow(long windowHandle);
 
+    // Raises a window to the top of the Z order so its pixels are no longer
+    // occluded, WITHOUT activating it or moving the foreground/keyboard focus.
+    // capture_screen / ocr_screen use this to un-occlude a target while leaving
+    // the user's focus where it is, unlike FocusWindow which steals foreground.
+    WindowActionResult RaiseWindowForCapture(long windowHandle);
+
     WindowActionResult MoveResizeWindow(long windowHandle, int? x, int? y, int? width, int? height);
 
     WindowActionResult SetWindowState(long windowHandle, string state);

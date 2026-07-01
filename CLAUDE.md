@@ -210,13 +210,19 @@ covered by `smoke-mcp.ps1`'s "agent-efficiency features" section:
   real foreground window.
 - `capture_screen` / `ocr_screen` `bring_to_front` (default `true`): when the
   target names a *specific window* (a numeric `target` or an explicit `hwnd`),
-  the dispatcher raises that window to the foreground (via the same
-  `WindowService.FocusWindow` activation, then a short settle delay) before the
+  the dispatcher raises that window to the top of the Z order (via
+  `WindowService.RaiseWindowForCapture`, then a short settle delay) before the
   pixels are read — otherwise `CopyFromScreen` photographs whatever sits on top
-  of an occluded/minimized target. No effect for screen targets or
-  `active_window` (already foreground); `TryResolveCaptureWindowHandle` returns
-  null for those. Pass `bring_to_front: false` to read a background window
-  without disturbing focus or z-order. `mutate-mcp.ps1` covers both paths.
+  of an occluded/minimized target. This is a **non-activating** raise
+  (`SetWindowPos` `HWND_TOP` + `SWP_NOACTIVATE`; a minimized target is restored
+  with `SW_SHOWNOACTIVATE`): it re-stacks the window for the grab but does **not**
+  steal keyboard focus from whatever the user is working in — deliberately the
+  opposite of `WindowService.ForceForeground`. Using `FocusWindow` here (as an
+  earlier version did) yanked focus to the captured window, which the user saw
+  as "the terminal grabs focus" when a capture targeted it. No effect for screen
+  targets or `active_window` (already foreground); `TryResolveCaptureWindowHandle`
+  returns null for those. Pass `bring_to_front: false` to read a background
+  window without disturbing z-order. `mutate-mcp.ps1` covers both paths.
 
 ## Conventions
 
