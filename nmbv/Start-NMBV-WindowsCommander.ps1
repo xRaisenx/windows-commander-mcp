@@ -143,7 +143,7 @@ function Stop-UnmanagedRawProfileOwners {
   }
 
   [array]$owners=Get-RawOwners
-  if($owners.Count -eq 0){return}
+  if(@($owners).Count -eq 0){return}
 
   foreach($process in $owners){
     Stop-RawOwnerAndWatchdog $process
@@ -153,7 +153,7 @@ function Stop-UnmanagedRawProfileOwners {
   Start-Sleep -Milliseconds 2500
 
   [array]$remaining=Get-RawOwners
-  if($remaining.Count -gt 0){
+  if(@($remaining).Count -gt 0){
     foreach($process in $remaining){
       Stop-RawOwnerAndWatchdog $process
     }
@@ -161,13 +161,36 @@ function Stop-UnmanagedRawProfileOwners {
     [array]$remaining=Get-RawOwners
   }
 
-  if($remaining.Count -gt 0){
+  if(@($remaining).Count -gt 0){
     $pids=($remaining | ForEach-Object { $_.ProcessId }) -join ','
     throw "Unable to retire raw Windows Commander profile owner(s): $pids"
   }
 }
 
-Stop-UnmanagedRawProfileOwners
+if($TakeManagedOwnership){
+  Stop-UnmanagedRawProfileOwners
+}else{
+  $rawAlias=[regex]::Escape([string]$cfg.alias)
+  $rawTunnelExe=[IO.Path]::GetFullPath([string]$cfg.tunnelClientPath).Replace('/','\')
+  [array]$rawOwners=@(Get-CimInstance Win32_Process -Filter "Name='tunnel-client.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+      $commandLine=[string]$_.CommandLine
+      $executablePath=[string]$_.ExecutablePath
+      if([string]::IsNullOrWhiteSpace($commandLine) -or [string]::IsNullOrWhiteSpace($executablePath)){return $false}
+
+      $sameExecutable=[IO.Path]::GetFullPath($executablePath).Replace('/','\').Equals(
+        $rawTunnelExe,
+        [StringComparison]::OrdinalIgnoreCase)
+      $isRawProfile=$commandLine -match "(?i)\brun\s+--profile\s+[`"']?$rawAlias[`"']?(?:\s|$)"
+      $isManaged=$commandLine -match '(?i)\brun\s+--profile-dir\b'
+      return $sameExecutable -and $isRawProfile -and -not $isManaged
+    })
+
+  if(@($rawOwners).Count -gt 0){
+    Write-Host "Windows Commander raw compatibility runtime is active; leaving it running. Use -TakeManagedOwnership only for an explicit cutover."
+    return
+  }
+}
 
 $s=Status
 if(Test-ManagedReady $s){
