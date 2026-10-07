@@ -8,7 +8,6 @@ using WindowsCommander.Safety.Audit;
 using WindowsCommander.Safety.Policy;
 using WindowsCommander.Windows.Services;
 
-var scrubbedEnvironmentVariables = EnvironmentSanitizer.ScrubCurrentProcess();
 using var instanceGuard = InstanceGuard.Acquire();
 
 var requireConfirmation = !IsUnattended();
@@ -37,8 +36,7 @@ Func<object> runtimeStatusProvider = () => CreateRuntimeStatus(
     maxConcurrency,
     requestTimeoutMs,
     maxRequestBytes,
-    requireConfirmation,
-    scrubbedEnvironmentVariables.Count);
+    requireConfirmation);
 
 var dispatcher = new ToolDispatcher(
     new ProcessService(),
@@ -172,8 +170,7 @@ static object CreateRuntimeStatus(
     int maxConcurrency,
     int requestTimeoutMs,
     int maxRequestBytes,
-    bool requireConfirmation,
-    int scrubbedEnvironmentVariableCount)
+    bool requireConfirmation)
 {
     int? sessionId = null;
     try
@@ -207,7 +204,7 @@ static object CreateRuntimeStatus(
         request_timeout_ms = requestTimeoutMs,
         max_request_bytes = maxRequestBytes,
         stdout_protocol_only = true,
-        scrubbed_environment_variable_count = scrubbedEnvironmentVariableCount,
+        inherited_child_secrets_allowed = ChildEnvironmentSanitizer.AllowsInheritedSecrets,
         scheduler = rescueConsole.Snapshot()
     };
 }
