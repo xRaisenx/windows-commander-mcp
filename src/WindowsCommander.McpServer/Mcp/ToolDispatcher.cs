@@ -26,6 +26,7 @@ public sealed class ToolDispatcher
     private readonly IControlIndicatorService controlIndicatorService;
     private readonly IAuditLog auditLog;
     private readonly IRiskPolicyService riskPolicy;
+    private readonly Func<object>? runtimeStatusProvider;
     // When true, high-risk tools are gated behind a local confirmation dialog.
     // Disabled (unattended mode) for automated harness/CI runs.
     private readonly bool requireConfirmation;
@@ -73,7 +74,8 @@ public sealed class ToolDispatcher
         IControlIndicatorService controlIndicatorService,
         IAuditLog auditLog,
         IRiskPolicyService riskPolicy,
-        bool requireConfirmation)
+        bool requireConfirmation,
+        Func<object>? runtimeStatusProvider = null)
     {
         this.processService = processService;
         this.windowService = windowService;
@@ -94,6 +96,7 @@ public sealed class ToolDispatcher
         this.auditLog = auditLog;
         this.riskPolicy = riskPolicy;
         this.requireConfirmation = requireConfirmation;
+        this.runtimeStatusProvider = runtimeStatusProvider;
     }
 
     public object ListTools()
@@ -324,7 +327,8 @@ public sealed class ToolDispatcher
                     Int("timeout_ms", "How long to wait for a response in milliseconds.")),
                 Tool("get_operation_history", "Returns a bounded audit log of recent tool executions.",
                     Int("limit", "Maximum number of audit entries to return (default 50)."),
-                    Bool("include_sensitive_arguments", "Include raw tool arguments in the output when true."))
+                    Bool("include_sensitive_arguments", "Include raw tool arguments in the output when true.")),
+                Tool("get_runtime_status", "Returns Windows Commander rescue health, queue state, policy, and build identity without probing Serena.")
             }
         };
     }
@@ -606,6 +610,13 @@ public sealed class ToolDispatcher
             "get_control_indicator_status" => DispatchControlIndicatorTool(name, arguments, cancellationToken),
             "request_user_confirmation" => DispatchControlIndicatorTool(name, arguments, cancellationToken),
             "get_operation_history" => DispatchAuditTool(name, arguments, cancellationToken),
+            "get_runtime_status" => runtimeStatusProvider?.Invoke() ?? new
+            {
+                healthy = true,
+                process_id = Environment.ProcessId,
+                server = ServerInfo.Name,
+                version = ServerInfo.Version
+            },
             _ => throw new ArgumentException($"Unknown tool: {name}")
         };
     }
