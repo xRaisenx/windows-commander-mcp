@@ -28,6 +28,7 @@ public sealed class ToolDispatcher
     private readonly IAuditLog auditLog;
     private readonly IRiskPolicyService riskPolicy;
     private readonly Func<object>? runtimeStatusProvider;
+    private readonly ProcessOperationSupervisor? processOperations;
     // When true, high-risk tools are gated behind a local confirmation dialog.
     // Disabled (unattended mode) for automated harness/CI runs.
     private readonly bool requireConfirmation;
@@ -76,7 +77,8 @@ public sealed class ToolDispatcher
         IAuditLog auditLog,
         IRiskPolicyService riskPolicy,
         bool requireConfirmation,
-        Func<object>? runtimeStatusProvider = null)
+        Func<object>? runtimeStatusProvider = null,
+        ProcessOperationSupervisor? processOperations = null)
     {
         this.processService = processService;
         this.windowService = windowService;
@@ -98,6 +100,7 @@ public sealed class ToolDispatcher
         this.riskPolicy = riskPolicy;
         this.requireConfirmation = requireConfirmation;
         this.runtimeStatusProvider = runtimeStatusProvider;
+        this.processOperations = processOperations;
     }
 
     public object ListTools()
@@ -329,7 +332,17 @@ public sealed class ToolDispatcher
                 Tool("get_operation_history", "Returns a bounded audit log of recent tool executions.",
                     Int("limit", "Maximum number of audit entries to return (default 50)."),
                     Bool("include_sensitive_arguments", "Include raw tool arguments in the output when true.")),
-                Tool("get_runtime_status", "Returns Windows Commander rescue health, queue state, policy, and build identity without probing Serena.")
+                Tool("get_runtime_status", "Returns Windows Commander rescue health, queue state, policy, and build identity without probing Serena."),
+                Tool("start_process_operation", "Starts a bounded long-running process operation and returns immediately with an operation id.",
+                    Str("executable_path", "Executable path or command to start.", required: true),
+                    StrArray("arguments", "Optional process arguments."),
+                    Str("working_directory", "Optional working directory."),
+                    Int("timeout_ms", "Operation timeout in milliseconds."),
+                    Int("max_output_bytes", "Combined bounded stdout/stderr budget.")),
+                Tool("get_process_operation", "Gets current state and bounded output for a long-running process operation.",
+                    Str("operation_id", "Operation id returned by start_process_operation.", required: true)),
+                Tool("cancel_process_operation", "Cancels an owned long-running process operation and its process tree.",
+                    Str("operation_id", "Operation id returned by start_process_operation.", required: true))
             }
         };
     }
@@ -618,6 +631,16 @@ public sealed class ToolDispatcher
                 server = ServerInfo.Name,
                 version = ServerInfo.Version
             },
+            "start_process_operation" => (processOperations ?? throw new InvalidOperationException("Process operation supervisor is unavailable.")).Start(
+                GetRequiredString(arguments, "executable_path"),
+                GetStringArray(arguments, "arguments"),
+                GetString(arguments, "working_directory"),
+                GetInt(arguments, "timeout_ms"),
+                GetInt(arguments, "max_output_bytes")),
+            "get_process_operation" => (processOperations ?? throw new InvalidOperationException("Process operation supervisor is unavailable.")).Get(
+                GetRequiredString(arguments, "operation_id")),
+            "cancel_process_operation" => (processOperations ?? throw new InvalidOperationException("Process operation supervisor is unavailable.")).Cancel(
+                GetRequiredString(arguments, "operation_id")),
             _ => throw new ArgumentException($"Unknown tool: {name}")
         };
     }
