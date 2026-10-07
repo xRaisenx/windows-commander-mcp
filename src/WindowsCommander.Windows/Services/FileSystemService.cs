@@ -9,6 +9,10 @@ namespace WindowsCommander.Windows.Services;
 
 public sealed class FileSystemService : IFileSystemService
 {
+    private const int DefaultMaxReadBytes = 256 * 1024;
+    private const int MaximumMaxReadBytes = 4 * 1024 * 1024;
+    private const int CopyBufferSize = 128 * 1024;
+
     public IReadOnlyList<DirectoryEntry> ListDirectory(
         string path,
         bool recursive,
@@ -19,11 +23,17 @@ public sealed class FileSystemService : IFileSystemService
     {
         var limit = Math.Clamp(maxResults ?? 1000, 1, 5000);
         var directory = new DirectoryInfo(NormalizeExistingDirectory(path));
+        var attributesToSkip = FileAttributes.ReparsePoint;
+        if (!includeHidden)
+        {
+            attributesToSkip |= FileAttributes.Hidden | FileAttributes.System;
+        }
+
         var options = new EnumerationOptions
         {
             RecurseSubdirectories = recursive,
             IgnoreInaccessible = true,
-            AttributesToSkip = includeHidden ? 0 : FileAttributes.Hidden | FileAttributes.System
+            AttributesToSkip = attributesToSkip
         };
         var results = new List<DirectoryEntry>(Math.Min(limit, 256));
 
@@ -40,23 +50,51 @@ public sealed class FileSystemService : IFileSystemService
         return results;
     }
 
-    public async Task<FileReadResult> ReadFileAsync(string path, string? encoding, int? maxBytes, bool asBase64, CancellationToken cancellationToken)
+    public async Task<FileReadResult> ReadFileAsync(
+        string path,
+        string? encoding,
+        int? maxBytes,
+        bool asBase64,
+        CancellationToken cancellationToken)
     {
         var fullPath = NormalizeExistingFile(path);
-        var bytes = await ReadLimitedBytesAsync(fullPath, maxBytes, cancellationToken);
+        var limit = Math.Clamp(maxBytes ?? DefaultMaxReadBytes, 1, MaximumMaxReadBytes);
+        var (bytes, totalBytes) = await ReadLimitedBytesAsync(fullPath, limit, cancellationToken);
+        var truncated = bytes.LongLength < totalBytes;
 
         if (asBase64)
         {
-            return new FileReadResult(fullPath, Convert.ToBase64String(bytes), "base64", IsBase64: true, bytes.Length);
+            return new FileReadResult(fullPath, Convert.ToBase64String(bytes), "base64", IsBase64: true, bytes.Length)
+            {
+                TotalBytes = totalBytes,
+                Truncated = truncated
+            };
         }
 
         var textEncoding = ResolveEncoding(encoding);
-        return new FileReadResult(fullPath, textEncoding.GetString(bytes), textEncoding.WebName, IsBase64: false, bytes.Length);
+        return new FileReadResult(
+            fullPath,
+            DecodePrefix(bytes, textEncoding, truncated),
+            textEncoding.WebName,
+            IsBase64: false,
+            bytes.Length)
+        {
+            TotalBytes = totalBytes,
+            Truncated = truncated
+        };
     }
 
-    public async Task<FileWriteResult> WriteFileAsync(string path, string content, string? encoding, bool overwrite, bool createDirectories, CancellationToken cancellationToken)
+    public async Task<FileWriteResult> WriteFileAsync(
+        string path,
+        string content,
+        string? encoding,
+        bool overwrite,
+        bool createDirectories,
+        string? expectedSha256,
+        CancellationToken cancellationToken)
     {
         var fullPath = Path.GetFullPath(path);
+        await using var mutationLock = await PathMutationLock.Shared.AcquireAsync(new[] { fullPath }, cancellationToken);
         var directoryPath = Path.GetDirectoryName(fullPath);
         var createdDirectory = false;
 
@@ -76,12 +114,45 @@ public sealed class FileSystemService : IFileSystemService
             throw new IOException($"File already exists and overwrite is false: {fullPath}");
         }
 
+        if (!string.IsNullOrWhiteSpace(expectedSha256))
+        {
+            await VerifyExpectedSha256Async(fullPath, expectedSha256, cancellationToken);
+        }
+
         var bytes = ResolveEncoding(encoding).GetBytes(content);
-        await File.WriteAllBytesAsync(fullPath, bytes, cancellationToken);
-        return new FileWriteResult(fullPath, bytes.LongLength, createdDirectory);
+        var tempPath = CreateSiblingTemporaryPath(fullPath, "write");
+        try
+        {
+            await WriteFileDurablyAsync(tempPath, bytes, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // External writers are not governed by our path lock. Revalidate
+            // the caller's expected identity at the commit boundary.
+            if (!string.IsNullOrWhiteSpace(expectedSha256))
+            {
+                await VerifyExpectedSha256Async(fullPath, expectedSha256, cancellationToken);
+            }
+
+            if (File.Exists(fullPath))
+            {
+                var existingAttributes = File.GetAttributes(fullPath);
+                File.Replace(tempPath, fullPath, destinationBackupFileName: null, ignoreMetadataErrors: true);
+                File.SetAttributes(fullPath, existingAttributes);
+            }
+            else
+            {
+                File.Move(tempPath, fullPath);
+            }
+
+            return new FileWriteResult(fullPath, bytes.LongLength, createdDirectory);
+        }
+        finally
+        {
+            TryDeleteFile(tempPath);
+        }
     }
 
-    public Task<PathOperationResult> CopyMoveDeletePathAsync(
+    public async Task<PathOperationResult> CopyMoveDeletePathAsync(
         string action,
         string sourcePath,
         string? destinationPath,
@@ -92,25 +163,28 @@ public sealed class FileSystemService : IFileSystemService
         cancellationToken.ThrowIfCancellationRequested();
         var sourceFullPath = Path.GetFullPath(sourcePath);
         var destinationFullPath = string.IsNullOrWhiteSpace(destinationPath) ? null : Path.GetFullPath(destinationPath);
+        await using var mutationLock = await PathMutationLock.Shared.AcquireAsync(
+            new[] { sourceFullPath, destinationFullPath },
+            cancellationToken);
 
         switch (action.ToLowerInvariant())
         {
             case "copy":
-                CopyPath(sourceFullPath, RequireDestination(destinationFullPath), recursive, overwrite);
+                await CopyPathAsync(sourceFullPath, RequireDestination(destinationFullPath), recursive, overwrite, cancellationToken);
                 break;
             case "move":
-                MovePath(sourceFullPath, RequireDestination(destinationFullPath), overwrite);
+                MovePathTransactional(sourceFullPath, RequireDestination(destinationFullPath), overwrite, cancellationToken);
                 break;
             case "delete":
-                DeletePath(sourceFullPath, recursive);
+                await DeletePathAsync(sourceFullPath, recursive, cancellationToken);
                 break;
             case "recycle":
-                throw new NotSupportedException("Recycle is not implemented in this slice; use delete for permanent deletion.");
+                throw new NotSupportedException("Recycle is not implemented and is not advertised by the MCP schema.");
             default:
                 throw new ArgumentException($"Unsupported path action: {action}");
         }
 
-        return Task.FromResult(new PathOperationResult(action, sourceFullPath, destinationFullPath, Completed: true));
+        return new PathOperationResult(action, sourceFullPath, destinationFullPath, Completed: true);
     }
 
     public async Task<FileProperties> GetFilePropertiesAsync(string path, string? hashAlgorithm, CancellationToken cancellationToken)
@@ -156,11 +230,17 @@ public sealed class FileSystemService : IFileSystemService
             }
 
             var rootPath = NormalizeExistingDirectory(root);
+            var attributesToSkip = FileAttributes.ReparsePoint;
+            if (!includeHidden)
+            {
+                attributesToSkip |= FileAttributes.Hidden | FileAttributes.System;
+            }
+
             var options = new EnumerationOptions
             {
                 RecurseSubdirectories = true,
                 IgnoreInaccessible = true,
-                AttributesToSkip = includeHidden ? 0 : FileAttributes.Hidden | FileAttributes.System
+                AttributesToSkip = attributesToSkip
             };
 
             foreach (var file in Directory.EnumerateFiles(rootPath, string.IsNullOrWhiteSpace(namePattern) ? "*" : namePattern, options))
@@ -198,20 +278,21 @@ public sealed class FileSystemService : IFileSystemService
             fileInfo?.Extension ?? string.Empty);
     }
 
-    private static async Task<byte[]> ReadLimitedBytesAsync(string fullPath, int? maxBytes, CancellationToken cancellationToken)
+    private static async Task<(byte[] Bytes, long TotalBytes)> ReadLimitedBytesAsync(
+        string fullPath,
+        int maxBytes,
+        CancellationToken cancellationToken)
     {
-        if (maxBytes is null)
-        {
-            return await File.ReadAllBytesAsync(fullPath, cancellationToken);
-        }
+        await using var stream = new FileStream(
+            fullPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 64 * 1024,
+            useAsync: true);
 
-        if (maxBytes <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(maxBytes), "max_bytes must be greater than zero.");
-        }
-
-        await using var stream = File.OpenRead(fullPath);
-        var length = (int)Math.Min(maxBytes.Value, stream.Length);
+        var totalBytes = stream.Length;
+        var length = (int)Math.Min(maxBytes, totalBytes);
         var buffer = new byte[length];
         var totalRead = 0;
 
@@ -226,7 +307,31 @@ public sealed class FileSystemService : IFileSystemService
             totalRead += read;
         }
 
-        return totalRead == length ? buffer : buffer[..totalRead];
+        return (totalRead == length ? buffer : buffer[..totalRead], totalBytes);
+    }
+
+    private static string DecodePrefix(byte[] bytes, Encoding encoding, bool truncated)
+    {
+        if (!truncated || bytes.Length == 0)
+        {
+            return encoding.GetString(bytes);
+        }
+
+        var decoder = encoding.GetDecoder();
+        var chars = new char[encoding.GetMaxCharCount(bytes.Length)];
+        decoder.Convert(
+            bytes,
+            0,
+            bytes.Length,
+            chars,
+            0,
+            chars.Length,
+            flush: false,
+            out _,
+            out var charsUsed,
+            out _);
+
+        return new string(chars, 0, charsUsed);
     }
 
     private static Encoding ResolveEncoding(string? encoding)
@@ -278,11 +383,16 @@ public sealed class FileSystemService : IFileSystemService
             : destinationPath;
     }
 
-    private static void CopyPath(string sourcePath, string destinationPath, bool recursive, bool overwrite)
+    private static async Task CopyPathAsync(
+        string sourcePath,
+        string destinationPath,
+        bool recursive,
+        bool overwrite,
+        CancellationToken cancellationToken)
     {
         if (File.Exists(sourcePath))
         {
-            File.Copy(sourcePath, destinationPath, overwrite);
+            await CopyFileAtomicallyAsync(sourcePath, destinationPath, overwrite, cancellationToken);
             return;
         }
 
@@ -296,13 +406,74 @@ public sealed class FileSystemService : IFileSystemService
             throw new IOException("Recursive must be true to copy directories.");
         }
 
-        CopyDirectory(sourcePath, destinationPath, overwrite);
+        var stage = CreateSiblingTemporaryPath(destinationPath, "copydir");
+        var backup = CreateSiblingTemporaryPath(destinationPath, "backup");
+        try
+        {
+            await CopyDirectoryAsync(sourcePath, stage, overwrite: false, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (Directory.Exists(destinationPath))
+            {
+                if (!overwrite)
+                {
+                    throw new IOException($"Destination directory already exists and overwrite is false: {destinationPath}");
+                }
+
+                Directory.Move(destinationPath, backup);
+            }
+            else if (File.Exists(destinationPath))
+            {
+                throw new IOException($"Destination is an existing file: {destinationPath}");
+            }
+
+            try
+            {
+                Directory.Move(stage, destinationPath);
+                if (Directory.Exists(backup))
+                {
+                    await DeleteDirectoryAsync(backup, cancellationToken);
+                }
+            }
+            catch
+            {
+                if (!Directory.Exists(destinationPath) && Directory.Exists(backup))
+                {
+                    Directory.Move(backup, destinationPath);
+                }
+
+                throw;
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(stage))
+            {
+                await DeleteDirectoryBestEffortAsync(stage);
+            }
+
+            if (Directory.Exists(backup) && Directory.Exists(destinationPath))
+            {
+                await DeleteDirectoryBestEffortAsync(backup);
+            }
+        }
     }
 
-    private static void MovePath(string sourcePath, string destinationPath, bool overwrite)
+    private static void MovePathTransactional(
+        string sourcePath,
+        string destinationPath,
+        bool overwrite,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (File.Exists(sourcePath))
         {
+            if (File.Exists(destinationPath) && !overwrite)
+            {
+                throw new IOException($"Destination file already exists and overwrite is false: {destinationPath}");
+            }
+
             File.Move(sourcePath, destinationPath, overwrite);
             return;
         }
@@ -312,45 +483,246 @@ public sealed class FileSystemService : IFileSystemService
             throw new FileNotFoundException($"Source path does not exist: {sourcePath}", sourcePath);
         }
 
-        if (Directory.Exists(destinationPath) && overwrite)
+        if (File.Exists(destinationPath))
         {
-            Directory.Delete(destinationPath, recursive: true);
+            throw new IOException($"Destination is an existing file: {destinationPath}");
         }
 
-        Directory.Move(sourcePath, destinationPath);
+        var backup = CreateSiblingTemporaryPath(destinationPath, "movebackup");
+        var hadDestination = Directory.Exists(destinationPath);
+        if (hadDestination && !overwrite)
+        {
+            throw new IOException($"Destination directory already exists and overwrite is false: {destinationPath}");
+        }
+
+        if (hadDestination)
+        {
+            Directory.Move(destinationPath, backup);
+        }
+
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Directory.Move(sourcePath, destinationPath);
+            if (Directory.Exists(backup))
+            {
+                Directory.Delete(backup, recursive: true);
+            }
+        }
+        catch
+        {
+            if (!Directory.Exists(destinationPath) && Directory.Exists(backup))
+            {
+                Directory.Move(backup, destinationPath);
+            }
+
+            throw;
+        }
     }
 
-    private static void DeletePath(string sourcePath, bool recursive)
+    private static async Task DeletePathAsync(string sourcePath, bool recursive, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (File.Exists(sourcePath))
         {
             File.Delete(sourcePath);
             return;
         }
 
-        if (Directory.Exists(sourcePath))
+        if (!Directory.Exists(sourcePath))
         {
-            Directory.Delete(sourcePath, recursive);
+            throw new FileNotFoundException($"Source path does not exist: {sourcePath}", sourcePath);
+        }
+
+        var attributes = File.GetAttributes(sourcePath);
+        if ((attributes & FileAttributes.ReparsePoint) != 0)
+        {
+            Directory.Delete(sourcePath, recursive: false);
             return;
         }
 
-        throw new FileNotFoundException($"Source path does not exist: {sourcePath}", sourcePath);
+        if (!recursive)
+        {
+            Directory.Delete(sourcePath, recursive: false);
+            return;
+        }
+
+        await DeleteDirectoryAsync(sourcePath, cancellationToken);
     }
 
-    private static void CopyDirectory(string sourceDirectory, string destinationDirectory, bool overwrite)
+    private static async Task CopyDirectoryAsync(
+        string sourceDirectory,
+        string destinationDirectory,
+        bool overwrite,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(destinationDirectory);
 
         foreach (var filePath in Directory.EnumerateFiles(sourceDirectory))
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            var attributes = File.GetAttributes(filePath);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                continue;
+            }
+
             var destinationFile = Path.Combine(destinationDirectory, Path.GetFileName(filePath));
-            File.Copy(filePath, destinationFile, overwrite);
+            await CopyFileAtomicallyAsync(filePath, destinationFile, overwrite, cancellationToken);
         }
 
         foreach (var directoryPath in Directory.EnumerateDirectories(sourceDirectory))
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            var attributes = File.GetAttributes(directoryPath);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                continue;
+            }
+
             var destinationSubdirectory = Path.Combine(destinationDirectory, Path.GetFileName(directoryPath));
-            CopyDirectory(directoryPath, destinationSubdirectory, overwrite);
+            await CopyDirectoryAsync(directoryPath, destinationSubdirectory, overwrite, cancellationToken);
+        }
+    }
+
+    private static async Task CopyFileAtomicallyAsync(
+        string sourcePath,
+        string destinationPath,
+        bool overwrite,
+        CancellationToken cancellationToken)
+    {
+        var destinationDirectory = Path.GetDirectoryName(destinationPath);
+        if (!string.IsNullOrWhiteSpace(destinationDirectory))
+        {
+            Directory.CreateDirectory(destinationDirectory);
+        }
+
+        if (File.Exists(destinationPath) && !overwrite)
+        {
+            throw new IOException($"Destination file already exists and overwrite is false: {destinationPath}");
+        }
+
+        var stage = CreateSiblingTemporaryPath(destinationPath, "copy");
+        try
+        {
+            await using (var source = new FileStream(
+                sourcePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                CopyBufferSize,
+                FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await using (var destination = new FileStream(
+                stage,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                CopyBufferSize,
+                FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                await source.CopyToAsync(destination, CopyBufferSize, cancellationToken);
+                destination.Flush(flushToDisk: true);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(stage, destinationPath, overwrite);
+        }
+        finally
+        {
+            TryDeleteFile(stage);
+        }
+    }
+
+    private static async Task DeleteDirectoryAsync(string directoryPath, CancellationToken cancellationToken)
+    {
+        foreach (var filePath in Directory.EnumerateFiles(directoryPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Delete(filePath);
+        }
+
+        foreach (var childDirectory in Directory.EnumerateDirectories(directoryPath))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var attributes = File.GetAttributes(childDirectory);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                Directory.Delete(childDirectory, recursive: false);
+                continue;
+            }
+
+            await DeleteDirectoryAsync(childDirectory, cancellationToken);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        Directory.Delete(directoryPath, recursive: false);
+    }
+
+    private static async Task DeleteDirectoryBestEffortAsync(string directoryPath)
+    {
+        try
+        {
+            await DeleteDirectoryAsync(directoryPath, CancellationToken.None);
+        }
+        catch
+        {
+            // Cleanup must not hide the primary operation outcome.
+        }
+    }
+
+    private static async Task WriteFileDurablyAsync(string path, byte[] bytes, CancellationToken cancellationToken)
+    {
+        await using var stream = new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 64 * 1024,
+            options: FileOptions.Asynchronous | FileOptions.WriteThrough);
+
+        await stream.WriteAsync(bytes, cancellationToken);
+        stream.Flush(flushToDisk: true);
+    }
+
+    private static string CreateSiblingTemporaryPath(string targetPath, string purpose)
+    {
+        var directory = Path.GetDirectoryName(targetPath);
+        var name = Path.GetFileName(targetPath);
+        return Path.Combine(directory ?? string.Empty, $".{name}.windows-commander-{purpose}-{Guid.NewGuid():N}.tmp");
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup only.
+        }
+    }
+
+    private static async Task VerifyExpectedSha256Async(
+        string path,
+        string expectedSha256,
+        CancellationToken cancellationToken)
+    {
+        if (!File.Exists(path))
+        {
+            throw new InvalidOperationException($"Guarded write target no longer exists: {path}");
+        }
+
+        var actual = await ComputeHashAsync(path, "SHA256", cancellationToken);
+        if (!string.Equals(actual, expectedSha256.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Guarded write rejected because the target changed. Expected SHA256 {expectedSha256}, actual {actual}.");
         }
     }
 

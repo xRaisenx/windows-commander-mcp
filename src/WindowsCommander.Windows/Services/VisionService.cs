@@ -1,5 +1,6 @@
 using System.Drawing.Imaging;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Windows.Graphics.Imaging;
 using Windows.Storage.Streams;
@@ -15,6 +16,8 @@ public sealed class VisionService : IVisionService
     // Caps the longest side of a returned capture so payloads stay small enough
     // to be usable; an explicit max_dimension argument can override this.
     private const int DefaultMaxDimension = 1400;
+    private const int MaximumMaxDimension = 4096;
+    private const long MaximumSourcePixels = 80_000_000;
 
     // The Windows on-device OCR engine, created lazily from the user's
     // installed languages and reused across calls.
@@ -44,9 +47,10 @@ public sealed class VisionService : IVisionService
             throw new ArgumentException("OCR region width and height must be greater than zero.");
         }
 
+        ValidateSourceRegion(resolvedRegion);
         var engine = GetOcrEngine();
 
-        // Capture the region's pixels.
+        // Capture only after validating the source allocation budget.
         using var bitmap = new System.Drawing.Bitmap(resolvedRegion.Width, resolvedRegion.Height);
         using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
         {
@@ -159,7 +163,8 @@ public sealed class VisionService : IVisionService
             (int)Math.Round((maxY - minY) / scale));
 
         // Windows.Media.Ocr does not expose a per-line confidence score.
-        return new OcrTextBlock(line.Text, 1.0, bounds);
+        // Unknown is more accurate than fabricated certainty.
+        return new OcrTextBlock(line.Text, null, bounds);
     }
 
     public VisualDetectionResult DetectVisualElements(string target, long? windowHandle, RectBounds? region, IReadOnlyList<string>? elementTypes)
@@ -171,7 +176,7 @@ public sealed class VisionService : IVisionService
 
         var candidates = WindowService.EnumerateWindows(visibleOnly: true)
             .Where(window => requestedTypes.Contains("window") && Intersects(window.BoundingRect, resolvedRegion))
-            .Select(window => new VisualElementCandidate("window", window.Title, 0.80, window.BoundingRect))
+            .Select(window => new VisualElementCandidate("window", window.Title, null, window.BoundingRect))
             .ToArray();
 
         return new VisualDetectionResult(candidates, resolvedRegion, DateTimeOffset.UtcNow);
@@ -222,13 +227,14 @@ public sealed class VisionService : IVisionService
 
     private static ScreenCaptureResult CaptureRegion(RectBounds region, string? monitorId, int? maxDimension)
     {
+        ValidateSourceRegion(region);
         using var bitmap = new System.Drawing.Bitmap(region.Width, region.Height);
         using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
         {
             graphics.CopyFromScreen(region.X, region.Y, 0, 0, new System.Drawing.Size(region.Width, region.Height));
         }
 
-        var cap = maxDimension is > 0 ? maxDimension.Value : DefaultMaxDimension;
+        var cap = Math.Clamp(maxDimension is > 0 ? maxDimension.Value : DefaultMaxDimension, 64, MaximumMaxDimension);
         var longestSide = Math.Max(region.Width, region.Height);
 
         using var stream = new MemoryStream();
@@ -283,15 +289,15 @@ public sealed class VisionService : IVisionService
         if (target.Equals("active_window", StringComparison.OrdinalIgnoreCase))
         {
             // The real foreground window — not just the first title-bearing
-            // window in z-order. Falls back to full_screen if it cannot be
-            // determined.
+            // window in z-order. Never broaden an active-window request into a
+            // full-desktop capture when the target cannot be resolved.
             var foreground = NativeMethods.GetForegroundWindow();
-            if (foreground != IntPtr.Zero && NativeMethods.GetWindowRect(foreground, out var rect))
+            if (foreground != IntPtr.Zero && IsWindow(foreground) && NativeMethods.GetWindowRect(foreground, out var rect))
             {
                 return new RectBounds(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
             }
 
-            return ResolveCaptureRegion("full_screen", null);
+            throw new InvalidOperationException("No foreground window is available for active_window capture.");
         }
 
         if (windowHandle is null && long.TryParse(target, out var parsedHandle))
@@ -311,6 +317,24 @@ public sealed class VisionService : IVisionService
 
         throw new ArgumentException($"Unsupported capture target: {target}");
     }
+
+    private static void ValidateSourceRegion(RectBounds region)
+    {
+        if (region.Width <= 0 || region.Height <= 0)
+        {
+            throw new ArgumentException("Capture region width and height must be greater than zero.");
+        }
+
+        var pixels = (long)region.Width * region.Height;
+        if (pixels > MaximumSourcePixels)
+        {
+            throw new ArgumentOutOfRangeException(nameof(region),
+                $"Capture source contains {pixels:N0} pixels; maximum is {MaximumSourcePixels:N0}. Capture a smaller region or monitor.");
+        }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr hWnd);
 
     private static bool Intersects(RectBounds left, RectBounds right)
     {

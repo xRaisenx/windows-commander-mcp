@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using System.Windows.Automation;
+using WindowsCommander.Windows.Native;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Services;
 
@@ -7,7 +9,11 @@ namespace WindowsCommander.Windows.Services;
 
 public sealed class UiAutomationService : IUiAutomationService
 {
-    private readonly ConcurrentDictionary<string, AutomationElement> elements = new(StringComparer.OrdinalIgnoreCase);
+    private const int MaxTreeElements = 2000;
+    private const int MaxFindResults = 200;
+    private const int MaxCachedElements = 4096;
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(2);
+    private readonly ConcurrentDictionary<string, CachedElement> elements = new(StringComparer.OrdinalIgnoreCase);
 
     public UiTreeResult ReadUiTree(long windowHandle, int maxDepth = 5, IReadOnlyList<string>? controlTypes = null, bool interactableOnly = false)
     {
@@ -15,10 +21,10 @@ public sealed class UiAutomationService : IUiAutomationService
         var root = GetRootElement(windowHandle);
         var truncated = false;
 
-        // Flatten is lazy; the filters compose on top of it. ToArray() still
-        // forces the full descent, so 'truncated' reflects the whole tree
-        // regardless of how many elements the filters keep.
-        IEnumerable<UiElementInfo> flattened = Flatten(root, depth, () => truncated = true);
+        // Bound traversal before materializing the result so a pathological UI
+        // tree cannot exhaust the MCP response budget.
+        IEnumerable<UiElementInfo> flattened = Flatten(root, windowHandle, depth, () => truncated = true)
+            .Take(MaxTreeElements + 1);
 
         if (controlTypes is { Count: > 0 })
         {
@@ -31,8 +37,14 @@ public sealed class UiAutomationService : IUiAutomationService
             flattened = flattened.Where(IsInteractable);
         }
 
-        var elements = flattened.ToArray();
-        return new UiTreeResult(elements, truncated, depth, elements.Length);
+        var materialized = flattened.ToArray();
+        if (materialized.Length > MaxTreeElements)
+        {
+            truncated = true;
+            materialized = materialized[..MaxTreeElements];
+        }
+
+        return new UiTreeResult(materialized, truncated, depth, materialized.Length);
     }
 
     // True when the element exposes a pattern an agent can act on. Used by
@@ -40,11 +52,12 @@ public sealed class UiAutomationService : IUiAutomationService
     // (panes, static text, group containers) and shrink the payload.
     private bool IsInteractable(UiElementInfo element)
     {
-        if (!elements.TryGetValue(element.ElementRef, out var automationElement))
+        if (!TryGetCached(element.ElementRef, out var cached))
         {
             return false;
         }
 
+        var automationElement = cached.Element;
         return automationElement.TryGetCurrentPattern(InvokePattern.Pattern, out _)
             || automationElement.TryGetCurrentPattern(TogglePattern.Pattern, out _)
             || automationElement.TryGetCurrentPattern(SelectionItemPattern.Pattern, out _)
@@ -54,9 +67,18 @@ public sealed class UiAutomationService : IUiAutomationService
 
     public IReadOnlyList<UiElementInfo> FindUiElement(long windowHandle, string? nameContains, string? automationId, string? controlType, string? className, bool enabledOnly, int maxDepth = 5)
     {
-        return ReadUiTree(windowHandle, maxDepth).Elements
-            .Where(element => Matches(element, nameContains, automationId, controlType, className, enabledOnly))
-            .ToArray();
+        var depth = Math.Clamp(maxDepth, 1, 20);
+        var root = GetRootElement(windowHandle);
+        var results = new List<UiElementInfo>();
+        foreach (var element in FlattenElements(root, 0, depth, static () => { }))
+        {
+            var info = ToInfo(element, windowHandle);
+            if (!Matches(info, nameContains, automationId, controlType, className, enabledOnly)) continue;
+            results.Add(info);
+            if (results.Count >= MaxFindResults) break;
+        }
+
+        return results;
     }
 
     public UiActionResult InvokeUiElement(string elementRef, string action)
@@ -103,10 +125,16 @@ public sealed class UiAutomationService : IUiAutomationService
 
     public UiElementDetails GetUiElementDetails(string elementRef)
     {
+        if (!TryGetCached(elementRef, out var cached))
+        {
+            throw new ArgumentException($"Unknown or expired UI element reference: {elementRef}");
+        }
+
         var element = GetElement(elementRef);
-        var info = ToInfo(element);
+        var rootHandle = cached.RootWindowHandle;
+        var info = ToInfo(element, rootHandle);
         var parent = TreeWalker.ControlViewWalker.GetParent(element);
-        var children = EnumerateChildren(element).Select(ToInfo).ToArray();
+        var children = EnumerateChildren(element).Select(child => ToInfo(child, rootHandle)).Take(MaxFindResults).ToArray();
         var actions = GetSupportedActions(element);
 
         return new UiElementDetails(info, actions, SafeName(parent), children);
@@ -119,16 +147,58 @@ public sealed class UiAutomationService : IUiAutomationService
 
     private AutomationElement GetElement(string elementRef)
     {
-        return elements.TryGetValue(elementRef, out var element)
-            ? element
-            : throw new ArgumentException($"Unknown UI element reference: {elementRef}");
+        if (!TryGetCached(elementRef, out var cached))
+        {
+            throw new ArgumentException($"Unknown or expired UI element reference: {elementRef}");
+        }
+
+        if (cached.RootWindowHandle != 0 && !IsWindow(new IntPtr(cached.RootWindowHandle)))
+        {
+            elements.TryRemove(elementRef, out _);
+            throw new InvalidOperationException("UI element root window is no longer valid.");
+        }
+
+        try
+        {
+            if (cached.Element.Current.ProcessId != cached.ProcessId)
+            {
+                elements.TryRemove(elementRef, out _);
+                throw new InvalidOperationException("UI element identity changed; reacquire it before acting.");
+            }
+        }
+        catch (ElementNotAvailableException)
+        {
+            elements.TryRemove(elementRef, out _);
+            throw new InvalidOperationException("UI element is no longer available.");
+        }
+
+        return cached.Element;
     }
 
-    private IEnumerable<UiElementInfo> Flatten(AutomationElement root, int maxDepth, Action onTruncated)
+    private bool TryGetCached(string elementRef, out CachedElement cached)
+    {
+        if (!elements.TryGetValue(elementRef, out var found))
+        {
+            cached = null!;
+            return false;
+        }
+
+        if (DateTimeOffset.UtcNow - found.CreatedUtc <= CacheTtl)
+        {
+            cached = found;
+            return true;
+        }
+
+        elements.TryRemove(elementRef, out _);
+        cached = null!;
+        return false;
+    }
+
+    private IEnumerable<UiElementInfo> Flatten(AutomationElement root, long rootWindowHandle, int maxDepth, Action onTruncated)
     {
         foreach (var element in FlattenElements(root, 0, maxDepth, onTruncated))
         {
-            yield return ToInfo(element);
+            yield return ToInfo(element, rootWindowHandle);
         }
     }
 
@@ -166,11 +236,20 @@ public sealed class UiAutomationService : IUiAutomationService
         }
     }
 
-    private UiElementInfo ToInfo(AutomationElement element)
+    private UiElementInfo ToInfo(AutomationElement element, long rootWindowHandle)
     {
         var runtimeId = string.Join(".", element.GetRuntimeId());
-        var elementRef = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(runtimeId));
-        elements[elementRef] = element;
+        var processId = element.Current.ProcessId;
+        var identity = $"{rootWindowHandle}:{processId}:{runtimeId}";
+        var elementRef = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(identity));
+        elements[elementRef] = new CachedElement(element, rootWindowHandle, processId, DateTimeOffset.UtcNow);
+        if (elements.Count > MaxCachedElements)
+        {
+            foreach (var stale in elements.OrderBy(pair => pair.Value.CreatedUtc).Take(elements.Count - MaxCachedElements))
+            {
+                elements.TryRemove(stale.Key, out _);
+            }
+        }
         var rectangle = element.Current.BoundingRectangle;
 
         return new UiElementInfo(
@@ -232,6 +311,11 @@ public sealed class UiAutomationService : IUiAutomationService
 
         return actions;
     }
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr hWnd);
+
+    private sealed record CachedElement(AutomationElement Element, long RootWindowHandle, int ProcessId, DateTimeOffset CreatedUtc);
 
     private static string SafeName(AutomationElement? element)
     {

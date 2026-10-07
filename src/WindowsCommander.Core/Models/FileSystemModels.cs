@@ -15,7 +15,11 @@ public sealed record FileReadResult(
     string Content,
     string Encoding,
     bool IsBase64,
-    long BytesRead);
+    long BytesRead)
+{
+    public long TotalBytes { get; init; } = BytesRead;
+    public bool Truncated { get; init; }
+}
 
 public sealed record FileWriteResult(
     string Path,

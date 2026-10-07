@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Services;
@@ -14,7 +15,12 @@ public sealed class InputService : IInputService
     private const uint MouseEventMiddleDown = 0x0020;
     private const uint MouseEventMiddleUp = 0x0040;
     private const uint MouseEventWheel = 0x0800;
+    private const uint MouseEventHorizontalWheel = 0x1000;
     private const uint KeyEventKeyUp = 0x0002;
+    private const int ClipboardOperationTimeoutMs = 5000;
+
+    [DllImport("user32.dll")]
+    private static extern uint GetClipboardSequenceNumber();
 
     public InputActionResult MouseAction(string action, string? button, int? x, int? y, long? targetWindowHandle)
     {
@@ -50,50 +56,51 @@ public sealed class InputService : IInputService
     public Task<InputActionResult> TypeTextAsync(string text, int? speedMs, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(text);
+        cancellationToken.ThrowIfCancellationRequested();
         if (text.Length == 0)
         {
             return Task.FromResult(new InputActionResult("type_text", Completed: true, 0));
         }
 
-        // Synthetic keystroke injection (SendInput / keybd_event) is unreliable
-        // for arbitrary text: once more than a dozen or so events are queued,
-        // modern apps drop, repeat, and reorder characters. Pasting via the
-        // clipboard hands the target the whole string in one atomic operation,
-        // so it always lands intact regardless of length or Unicode content.
-        // The caller's clipboard text is saved and restored around the paste.
+        // Text entry intentionally uses one clipboard paste rather than a long
+        // synthetic-key sequence, preserving Unicode and avoiding key loss.
+        // speedMs is retained only for interface compatibility and is not
+        // advertised as a public control by the MCP schema.
         PasteText(text);
         return Task.FromResult(new InputActionResult("type_text", Completed: true, text.Length));
     }
 
     private void PasteText(string text)
     {
-        RunOnStaThread(() =>
+        StaExecutor.Shared.Invoke(() =>
         {
             var restoreClipboard = CaptureClipboard();
+            Clipboard.SetText(text);
+            var ownedSequence = GetClipboardSequenceNumber();
+
             try
             {
-                Clipboard.SetText(text);
                 SendHotkey(new[] { "ctrl" }, "v");
 
-                // The target reads the clipboard asynchronously when it handles
-                // the Ctrl+V. Restoring the previous contents too soon wins the
-                // race and the target pastes nothing, so wait long enough for
-                // even a busy app to have consumed the paste.
+                // The target reads clipboard data asynchronously. Keep the
+                // prior conservative settle period until a target-observed
+                // completion primitive is proven across supported apps.
                 Thread.Sleep(400);
             }
             finally
             {
-                restoreClipboard();
+                // Never overwrite content copied by the user/application while
+                // Windows Commander was waiting for the paste to be consumed.
+                if (GetClipboardSequenceNumber() == ownedSequence)
+                {
+                    restoreClipboard();
+                }
             }
 
             return true;
-        });
+        }, ClipboardOperationTimeoutMs);
     }
 
-    // Snapshots every format currently on the clipboard and returns an action
-    // that restores it. This preserves images and file lists too, not just
-    // text, so a type_text call never silently destroys what the user copied.
-    // Must be called on an STA thread.
     private static Action CaptureClipboard()
     {
         try
@@ -102,8 +109,6 @@ public sealed class InputService : IInputService
             var formats = current?.GetFormats(autoConvert: false);
             if (current is null || formats is null || formats.Length == 0)
             {
-                // The clipboard was empty: restoring means clearing the text
-                // this paste is about to put there.
                 return static () => Clipboard.Clear();
             }
 
@@ -122,13 +127,10 @@ public sealed class InputService : IInputService
                 }
                 catch
                 {
-                    // Some formats expose data that cannot be read or cloned
-                    // (delay-rendered or COM-backed); skip them.
+                    // Delay-rendered or COM-backed formats can be unreadable.
                 }
             }
 
-            // If nothing could be cloned, leave the typed text on the clipboard
-            // rather than blindly clearing content we failed to capture.
             return captured
                 ? () => Clipboard.SetDataObject(snapshot, copy: true)
                 : static () => { };
@@ -137,36 +139,6 @@ public sealed class InputService : IInputService
         {
             return static () => { };
         }
-    }
-
-    // Clipboard access requires an STA thread; the MCP server's worker threads
-    // are MTA. Mirrors the helper in ClipboardService.
-    private static T RunOnStaThread<T>(Func<T> action)
-    {
-        T? result = default;
-        Exception? error = null;
-        var thread = new Thread(() =>
-        {
-            try
-            {
-                result = action();
-            }
-            catch (Exception exception)
-            {
-                error = exception;
-            }
-        });
-
-        thread.SetApartmentState(ApartmentState.STA);
-        thread.Start();
-        thread.Join();
-
-        if (error is not null)
-        {
-            throw error;
-        }
-
-        return result!;
     }
 
     public InputActionResult SendHotkey(IReadOnlyList<string> modifiers, string key)
@@ -223,7 +195,9 @@ public sealed class InputService : IInputService
     {
         var (targetX, targetY) = ResolvePoint(x, y, targetWindowHandle);
         NativeMethods.SetCursorPos(targetX, targetY);
-        var delta = direction.ToLowerInvariant() switch
+
+        var normalized = direction.ToLowerInvariant();
+        var delta = normalized switch
         {
             "up" => 120 * Math.Abs(amount),
             "down" => -120 * Math.Abs(amount),
@@ -231,8 +205,9 @@ public sealed class InputService : IInputService
             "right" => 120 * Math.Abs(amount),
             _ => throw new ArgumentException($"Unsupported wheel direction: {direction}")
         };
+        var flag = normalized is "left" or "right" ? MouseEventHorizontalWheel : MouseEventWheel;
 
-        NativeMethods.mouse_event(MouseEventWheel, 0, 0, unchecked((uint)delta), 0);
+        NativeMethods.mouse_event(flag, 0, 0, unchecked((uint)delta), 0);
         return new InputActionResult("mouse_wheel", Completed: true, 1);
     }
 
@@ -274,6 +249,7 @@ public sealed class InputService : IInputService
     public async Task<InputActionResult> InputSequenceAsync(IReadOnlyList<InputSequenceStep> steps, bool abortOnError, CancellationToken cancellationToken)
     {
         var completed = 0;
+        Exception? firstError = null;
         foreach (var step in steps)
         {
             try
@@ -301,9 +277,15 @@ public sealed class InputService : IInputService
 
                 completed++;
             }
-            catch when (!abortOnError)
+            catch (Exception exception) when (!abortOnError)
             {
+                firstError ??= exception;
             }
+        }
+
+        if (firstError is not null && completed == 0)
+        {
+            throw new InvalidOperationException($"Input sequence failed before completing any step: {firstError.Message}", firstError);
         }
 
         return new InputActionResult("input_sequence", completed == steps.Count, completed);

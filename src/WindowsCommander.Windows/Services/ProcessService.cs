@@ -9,14 +9,35 @@ public sealed class ProcessService : IProcessService
 {
     public IReadOnlyList<ProcessSummary> ListProcesses(string? filterName, bool sortByMemory)
     {
-        var processes = Process.GetProcesses()
-            .Where(process => MatchesFilter(process, filterName))
-            .Select(ToSummary)
-            .ToArray();
+        var summaries = new List<ProcessSummary>();
+        foreach (var process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                try
+                {
+                    if (!MatchesFilter(process, filterName))
+                    {
+                        continue;
+                    }
+
+                    summaries.Add(ToSummary(process));
+                }
+                catch (InvalidOperationException)
+                {
+                    // Processes can disappear between enumeration and inspection.
+                }
+                catch (Win32Exception)
+                {
+                    // Access to some protected processes is denied; skip them
+                    // without failing the entire listing.
+                }
+            }
+        }
 
         return sortByMemory
-            ? processes.OrderByDescending(process => process.MemoryUsageMB).ToArray()
-            : processes.OrderBy(process => process.ProcessName, StringComparer.OrdinalIgnoreCase).ToArray();
+            ? summaries.OrderByDescending(process => process.MemoryUsageMB).ToArray()
+            : summaries.OrderBy(process => process.ProcessName, StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
     public ProcessDetails GetProcessDetails(int pid)
@@ -37,28 +58,69 @@ public sealed class ProcessService : IProcessService
 
     public ProcessActionResult ManageProcess(int pid, string action)
     {
-        using var process = Process.GetProcessById(pid);
-        switch (action.ToLowerInvariant())
+        if (pid == Environment.ProcessId)
         {
-            case "terminate":
-            case "kill":
-                process.Kill(entireProcessTree: false);
-                break;
-            case "kill_tree":
-                process.Kill(entireProcessTree: true);
-                break;
-            case "close_main_window":
-                if (!process.CloseMainWindow())
-                {
-                    throw new InvalidOperationException($"Process does not have a closable main window: {pid}");
-                }
-
-                break;
-            default:
-                throw new ArgumentException($"Unsupported process action: {action}");
+            throw new InvalidOperationException("Windows Commander refuses to terminate its own MCP process.");
         }
 
-        return new ProcessActionResult(pid, action, Completed: true);
+        using var process = Process.GetProcessById(pid);
+        var normalizedAction = action.ToLowerInvariant();
+        var completed = normalizedAction switch
+        {
+            "terminate" or "kill" => KillAndVerify(process, entireProcessTree: false),
+            "kill_tree" => KillAndVerify(process, entireProcessTree: true),
+            "close_main_window" => CloseMainWindowAndVerify(process),
+            _ => throw new ArgumentException($"Unsupported process action: {action}")
+        };
+
+        return new ProcessActionResult(pid, action, completed);
+    }
+
+    private static bool KillAndVerify(Process process, bool entireProcessTree)
+    {
+        process.Kill(entireProcessTree);
+        return WaitForExit(process, TimeSpan.FromSeconds(5));
+    }
+
+    private static bool CloseMainWindowAndVerify(Process process)
+    {
+        if (!process.CloseMainWindow())
+        {
+            throw new InvalidOperationException($"Process does not have a closable main window: {process.Id}");
+        }
+
+        if (WaitForExit(process, TimeSpan.FromSeconds(5)))
+        {
+            return true;
+        }
+
+        try
+        {
+            process.Refresh();
+            return process.MainWindowHandle == IntPtr.Zero;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+    }
+
+    private static bool WaitForExit(Process process, TimeSpan timeout)
+    {
+        try
+        {
+            if (process.WaitForExit((int)timeout.TotalMilliseconds))
+            {
+                return true;
+            }
+
+            process.Refresh();
+            return process.HasExited;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
     }
 
     private static bool MatchesFilter(Process process, string? filterName)
@@ -69,14 +131,11 @@ public sealed class ProcessService : IProcessService
 
     private static ProcessSummary ToSummary(Process process)
     {
-        using (process)
-        {
-            return new ProcessSummary(
-                process.Id,
-                process.ProcessName,
-                Math.Round(process.WorkingSet64 / 1024d / 1024d, 2),
-                GetMainWindowTitle(process));
-        }
+        return new ProcessSummary(
+            process.Id,
+            process.ProcessName,
+            Math.Round(process.WorkingSet64 / 1024d / 1024d, 2),
+            GetMainWindowTitle(process));
     }
 
     private static string GetMainWindowTitle(Process process)

@@ -35,11 +35,11 @@ public sealed record UiElementDetails(
 
 public sealed record UiActionResult(string ElementRef, string Action, bool Completed);
 
-public sealed record OcrTextBlock(string Text, double Confidence, RectBounds Bounds);
+public sealed record OcrTextBlock(string Text, double? Confidence, RectBounds Bounds);
 
 public sealed record OcrResult(IReadOnlyList<OcrTextBlock> Blocks, string CombinedText, RectBounds Region, DateTimeOffset CapturedAt);
 
-public sealed record VisualElementCandidate(string ElementType, string Label, double Confidence, RectBounds Bounds);
+public sealed record VisualElementCandidate(string ElementType, string Label, double? Confidence, RectBounds Bounds);
 
 public sealed record VisualDetectionResult(IReadOnlyList<VisualElementCandidate> Candidates, RectBounds Region, DateTimeOffset CapturedAt);
 

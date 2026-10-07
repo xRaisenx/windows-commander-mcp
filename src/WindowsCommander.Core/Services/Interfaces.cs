@@ -94,7 +94,7 @@ public interface IFileSystemService
 
     Task<FileReadResult> ReadFileAsync(string path, string? encoding, int? maxBytes, bool asBase64, CancellationToken cancellationToken);
 
-    Task<FileWriteResult> WriteFileAsync(string path, string content, string? encoding, bool overwrite, bool createDirectories, CancellationToken cancellationToken);
+    Task<FileWriteResult> WriteFileAsync(string path, string content, string? encoding, bool overwrite, bool createDirectories, string? expectedSha256, CancellationToken cancellationToken);
 
     Task<PathOperationResult> CopyMoveDeletePathAsync(
         string action,
