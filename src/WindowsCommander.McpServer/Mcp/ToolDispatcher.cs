@@ -355,7 +355,9 @@ public sealed class ToolDispatcher
                     Str("executable_path", "Language server executable path.", required: true),
                     StrArray("arguments", "Language server arguments."),
                     Str("workspace_root", "Workspace root for the language server.", required: true),
-                    Str("language_id", "LSP language id such as csharp, typescript, javascript, or python.", required: true)),
+                    Str("language_id", "LSP language id such as csharp, typescript, javascript, or python.", required: true),
+                    Str("tsserver_path", "Optional path to TypeScript lib or tsserver.js passed as initializationOptions.tsserver.path; JS/TS only."),
+                    Str("tsserver_fallback_path", "Optional fallback TypeScript lib or tsserver.js path; defaults to WINDOWS_COMMANDER_TSSERVER_FALLBACK_PATH for JS/TS.")),
                 Tool("codeintel_status", "Returns status for an isolated semantic rescue session.",
                     Str("session_id", "CodeIntel session id.", required: true)),
                 Tool("codeintel_symbols", "Returns semantic document symbols for a source file.",
@@ -699,7 +701,6 @@ public sealed class ToolDispatcher
                 => await DispatchSerenaRescueToolAsync(name, arguments, cancellationToken),            _ => throw new ArgumentException($"Unknown tool: {name}")
         };
     }
-
     private async Task<object> DispatchCodeIntelToolAsync(
         string name,
         JsonElement? arguments,
@@ -714,6 +715,8 @@ public sealed class ToolDispatcher
                 GetStringArray(arguments, "arguments") ?? Array.Empty<string>(),
                 GetRequiredString(arguments, "workspace_root"),
                 GetRequiredString(arguments, "language_id"),
+                GetString(arguments, "tsserver_path"),
+                GetString(arguments, "tsserver_fallback_path"),
                 cancellationToken),
             "codeintel_status" => manager.Status(GetRequiredString(arguments, "session_id")),
             "codeintel_symbols" => await manager.SymbolsAsync(
@@ -748,7 +751,6 @@ public sealed class ToolDispatcher
             _ => throw new ArgumentException($"Unknown CodeIntel tool: {name}")
         };
     }
-
     private async Task<object> ReplaceCodeIntelSymbolAsync(
         CodeIntelManager manager,
         JsonElement? arguments,

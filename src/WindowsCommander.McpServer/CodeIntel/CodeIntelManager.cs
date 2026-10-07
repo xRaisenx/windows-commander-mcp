@@ -9,12 +9,13 @@ namespace WindowsCommander.McpServer.CodeIntel;
 public sealed class CodeIntelManager : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, Session> sessions = new(StringComparer.Ordinal);
-
     public async Task<object> StartAsync(
         string executable,
         IReadOnlyList<string> arguments,
         string workspaceRoot,
         string languageId,
+        string? tsserverPath,
+        string? tsserverFallbackPath,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(executable))
@@ -28,9 +29,28 @@ public sealed class CodeIntelManager : IAsyncDisposable
             throw new DirectoryNotFoundException($"CodeIntel workspace does not exist: {root}");
         }
 
+        var normalizedLanguageId = NormalizeLanguageId(languageId);
+        var usesTypeScriptServer = normalizedLanguageId is "typescript" or "javascript";
+        var configuredTsserverPath = usesTypeScriptServer
+            ? (string.IsNullOrWhiteSpace(tsserverPath)
+                ? Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_TSSERVER_PATH")
+                : tsserverPath)
+            : null;
+        var configuredTsserverFallbackPath = usesTypeScriptServer
+            ? (string.IsNullOrWhiteSpace(tsserverFallbackPath)
+                ? Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_TSSERVER_FALLBACK_PATH")
+                : tsserverFallbackPath)
+            : null;
+
         var id = Guid.NewGuid().ToString("N");
-        var client = await LspClient.StartAsync(executable, arguments, root, cancellationToken);
-        var session = new Session(id, root, NormalizeLanguageId(languageId), executable, arguments.ToArray(), client);
+        var client = await LspClient.StartAsync(
+            executable,
+            arguments,
+            root,
+            configuredTsserverPath,
+            configuredTsserverFallbackPath,
+            cancellationToken);
+        var session = new Session(id, root, normalizedLanguageId, executable, arguments.ToArray(), client);
 
         if (!sessions.TryAdd(id, session))
         {
@@ -40,7 +60,6 @@ public sealed class CodeIntelManager : IAsyncDisposable
 
         return session.Status();
     }
-
     public object Status(string sessionId)
     {
         var session = GetSession(sessionId);
