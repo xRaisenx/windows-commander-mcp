@@ -23,6 +23,6 @@ public class ProcessServiceTests
 
         var results = service.ListProcesses(current.ProcessName, sortByMemory: false);
 
-        Assert.Contains(results, process => process.Pid == Environment.ProcessId);
+        Assert.Contains(results, process => process.PID == Environment.ProcessId);
     }
 }
