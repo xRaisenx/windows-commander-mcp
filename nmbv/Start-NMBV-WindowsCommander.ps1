@@ -24,6 +24,20 @@ if(-not (Test-Path -LiteralPath $RuntimeConfigPath)){
 }
 
 $cfg=Get-Content -LiteralPath $RuntimeConfigPath -Raw | ConvertFrom-Json
+$runtimeApiKeyRef=[string](Get-ObjectProperty $cfg 'runtimeApiKeyRef' '')
+if($runtimeApiKeyRef -match '^env:(.+)$'){
+  $runtimeKeyName=$Matches[1]
+  $runtimeKeyValue=[Environment]::GetEnvironmentVariable($runtimeKeyName,'Process')
+  if([string]::IsNullOrWhiteSpace($runtimeKeyValue)){
+    $runtimeKeyValue=[Environment]::GetEnvironmentVariable($runtimeKeyName,'User')
+    if([string]::IsNullOrWhiteSpace($runtimeKeyValue)){
+      $runtimeKeyValue=[Environment]::GetEnvironmentVariable($runtimeKeyName,'Machine')
+    }
+    if(-not [string]::IsNullOrWhiteSpace($runtimeKeyValue)){
+      [Environment]::SetEnvironmentVariable($runtimeKeyName,$runtimeKeyValue,'Process')
+    }
+  }
+}
 foreach($required in @('alias','tunnelId','runtimeApiKeyRef','tunnelClientPath','executable')){
   $value=[string](Get-ObjectProperty $cfg $required '')
   if([string]::IsNullOrWhiteSpace($value)){
