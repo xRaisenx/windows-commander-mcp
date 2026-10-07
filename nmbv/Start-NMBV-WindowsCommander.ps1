@@ -126,7 +126,7 @@ function Stop-UnmanagedRawProfileOwners {
       })
   }
 
-  $owners=Get-RawOwners
+  [array]$owners=Get-RawOwners
   if($owners.Count -eq 0){return}
 
   $watchdogParents=@($owners | ForEach-Object { [int]$_.ParentProcessId } | Sort-Object -Unique)
@@ -135,7 +135,7 @@ function Stop-UnmanagedRawProfileOwners {
   }
 
   Start-Sleep -Milliseconds 350
-  $respawned=Get-RawOwners
+  [array]$respawned=Get-RawOwners
   if($respawned.Count -gt 0){
     foreach($process in $respawned){
       $parentId=[int]$process.ParentProcessId
@@ -152,7 +152,7 @@ function Stop-UnmanagedRawProfileOwners {
     Start-Sleep -Milliseconds 350
   }
 
-  $remaining=Get-RawOwners
+  [array]$remaining=Get-RawOwners
   if($remaining.Count -gt 0){
     $pids=($remaining | ForEach-Object { $_.ProcessId }) -join ','
     throw "Unable to retire raw Windows Commander profile owner(s): $pids"

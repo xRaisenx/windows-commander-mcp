@@ -297,7 +297,7 @@ static async Task<JsonRpcResponse?> HandleLineAsync(
         var toolName = GetRequiredString(request.Params, "name");
         var arguments = GetProperty(request.Params, "arguments");
         var lane = ClassifyLane(toolName);
-        using var activity = rescueConsole.Queued(lane, toolName);
+        using var activity = rescueConsole.Queued(lane, toolName, DescribeRequest(toolName, arguments));
 
         SemaphoreSlim? laneSemaphore = lane switch
         {
@@ -315,6 +315,7 @@ static async Task<JsonRpcResponse?> HandleLineAsync(
         {
             activity.MarkStarted();
             var result = await CallToolWithDeadlineAsync(dispatcher, toolName, arguments, requestTimeoutMs);
+            activity.MarkResult(DescribeResult(toolName, result));
             return JsonRpcResponse.Success(request.Id, result);
         }
         catch (Exception exception)
@@ -369,6 +370,322 @@ static string ClassifyLane(string toolName)
         _ => "READ"
     };
 }
+
+static string? DescribeRequest(string toolName, JsonElement? arguments)
+{
+    string? path = SafeArg(arguments, "path");
+    string? source = SafeArg(arguments, "source_path");
+    string? destination = SafeArg(arguments, "destination_path");
+
+    return toolName switch
+    {
+        "read_file" => Clip(path),
+        "write_file" => JoinDetail(
+            Clip(path),
+            $"overwrite={SafeBool(arguments, "overwrite") ?? false}",
+            $"chars={SafeArg(arguments, "content")?.Length ?? 0}"),
+        "list_directory" => JoinDetail(Clip(path), SafeArg(arguments, "pattern")),
+        "search_files" => JoinDetail(
+            $"roots={SafeArrayCount(arguments, "roots")}",
+            SafeArg(arguments, "name_pattern")),
+        "copy_move_delete_path" => JoinDetail(
+            SafeArg(arguments, "action"),
+            Clip(source),
+            string.IsNullOrWhiteSpace(destination) ? null : $"-> {Clip(destination)}"),
+        "get_file_properties" => Clip(path),
+
+        "execute_process" => JoinDetail(
+            SafeExecutable(SafeArg(arguments, "executable_path")),
+            $"args={SafeArrayCount(arguments, "arguments")}",
+            $"wait={SafeBool(arguments, "wait_for_exit") ?? false}"),
+        "execute_powershell" => $"PowerShell | chars={SafeArg(arguments, "command")?.Length ?? 0}",
+        "start_process_operation" => JoinDetail(
+            SafeExecutable(SafeArg(arguments, "executable_path")),
+            $"args={SafeArrayCount(arguments, "arguments")}"),
+        "get_process_operation" or "cancel_process_operation" =>
+            $"operation={Clip(SafeArg(arguments, "operation_id"), 36)}",
+        "manage_process" => JoinDetail(
+            SafeArg(arguments, "action"),
+            $"pid={SafeInt(arguments, "pid")}"),
+        "get_process_details" => $"pid={SafeInt(arguments, "pid")}",
+        "list_processes" => JoinDetail(
+            SafeArg(arguments, "filter_name"),
+            (SafeBool(arguments, "sort_by_memory") ?? false) ? "sort=memory" : null),
+
+        "focus_window" or "move_resize_window" or "set_window_state" =>
+            $"hwnd={SafeLong(arguments, "window_handle")}",
+        "find_window" => JoinDetail(
+            SafeArg(arguments, "title_contains"),
+            SafeArg(arguments, "process_name")),
+        "wait_for_window" => JoinDetail(
+            SafeArg(arguments, "title_contains"),
+            $"timeout={SafeInt(arguments, "timeout_ms")}ms"),
+
+        "capture_screen" or "ocr_screen" or "detect_visual_elements" =>
+            JoinDetail(SafeArg(arguments, "target"), $"hwnd={SafeLong(arguments, "window_handle")}"),
+        "capture_screen_region" => JoinDetail(
+            $"x={SafeInt(arguments, "x")}",
+            $"y={SafeInt(arguments, "y")}",
+            $"{SafeInt(arguments, "width")}x{SafeInt(arguments, "height")}"),
+
+        "clipboard_access" => SafeArg(arguments, "action"),
+        "type_text" => $"chars={SafeArg(arguments, "text")?.Length ?? 0}",
+        "send_hotkey" => JoinDetail(
+            $"mods={SafeArrayCount(arguments, "modifiers")}",
+            SafeArg(arguments, "key")),
+        "keyboard_action" => JoinDetail(
+            SafeArg(arguments, "action"),
+            SafeArg(arguments, "key")),
+        "mouse_action" => JoinDetail(
+            SafeArg(arguments, "action"),
+            $"x={SafeInt(arguments, "x")}",
+            $"y={SafeInt(arguments, "y")}"),
+        "mouse_wheel" => JoinDetail(
+            SafeArg(arguments, "direction"),
+            $"amount={SafeInt(arguments, "amount")}"),
+
+        "environment_variable" => JoinDetail(
+            SafeArg(arguments, "action"),
+            SafeArg(arguments, "name")),
+        "registry_access" => JoinDetail(
+            SafeArg(arguments, "action"),
+            Clip(SafeArg(arguments, "path"))),
+        "service_control" => JoinDetail(
+            SafeArg(arguments, "action"),
+            SafeArg(arguments, "service_name")),
+        "launch_app" => JoinDetail(
+            SafeExecutable(SafeArg(arguments, "executable_path")),
+            SafeArg(arguments, "app_name")),
+
+        "codeintel_start" => JoinDetail(
+            SafeArg(arguments, "language_id"),
+            Clip(SafeArg(arguments, "workspace_root"))),
+        "codeintel_status" or "codeintel_stop" =>
+            $"session={Clip(SafeArg(arguments, "session_id"), 24)}",
+        "codeintel_symbols" or "codeintel_diagnostics" =>
+            JoinDetail(
+                $"session={Clip(SafeArg(arguments, "session_id"), 18)}",
+                Clip(path)),
+        "codeintel_definition" or "codeintel_references" or "codeintel_safe_delete_preflight" =>
+            JoinDetail(
+                Clip(path),
+                $"line={SafeInt(arguments, "line")}",
+                $"char={SafeInt(arguments, "character")}"),
+        "codeintel_replace_symbol" => JoinDetail(
+            Clip(path),
+            $"symbol={Clip(SafeArg(arguments, "symbol_name"), 40)}",
+            $"replacement_chars={SafeArg(arguments, "replacement")?.Length ?? 0}"),
+
+        "serena_rescue_restart" => $"timeout={SafeInt(arguments, "timeout_ms")}ms",
+        "serena_rescue_logs" => JoinDetail(
+            $"files={SafeInt(arguments, "max_files")}",
+            $"lines={SafeInt(arguments, "lines_per_file")}"),
+
+        _ => DescribeGenericArguments(arguments)
+    };
+}
+
+static string? DescribeResult(string toolName, object result)
+{
+    try
+    {
+        var json = JsonSerializer.SerializeToElement(result, JsonOptions.Default);
+
+        if (json.ValueKind == JsonValueKind.Array)
+        {
+            return $"count={json.GetArrayLength()}";
+        }
+
+        if (json.ValueKind != JsonValueKind.Object)
+        {
+            return "completed";
+        }
+
+        return toolName switch
+        {
+            "read_file" => JoinDetail(
+                $"read={JsonLong(json, "bytesRead")}B",
+                JsonBool(json, "truncated") == true ? $"TRUNCATED total={JsonLong(json, "totalBytes")}B" : null),
+            "write_file" => $"{JsonLong(json, "bytesWritten")}B written",
+            "execute_process" => JoinDetail(
+                $"pid={JsonLong(json, "processId")}",
+                $"exit={JsonLong(json, "exitCode")}",
+                JsonBool(json, "timedOut") == true ? "TIMEOUT" : null),
+            "execute_powershell" => JoinDetail(
+                $"exit={JsonLong(json, "exitCode")}",
+                $"stdout={JsonStringLength(json, "standardOutput")} chars",
+                $"stderr={JsonStringLength(json, "standardError")} chars",
+                JsonBool(json, "timedOut") == true ? "TIMEOUT" : null),
+            "start_process_operation" => JoinDetail(
+                $"operation={Clip(JsonString(json, "operationId"), 24)}",
+                JsonString(json, "state"),
+                $"pid={JsonLong(json, "processId")}"),
+            "get_process_operation" => JoinDetail(
+                JsonString(json, "state"),
+                $"pid={JsonLong(json, "processId")}",
+                $"exit={JsonLong(json, "exitCode")}"),
+            "serena_rescue_status" => JoinDetail(
+                $"healthy={JsonBool(json, "healthy")}",
+                JsonNestedBool(json, "router", "listening") == true ? "router=up" : "router=down",
+                JsonNestedBool(json, "master", "listening") == true ? "master=up" : "master=down"),
+            "codeintel_replace_symbol" => JoinDetail(
+                $"applied={JsonBool(json, "applied")}",
+                $"rollback={JsonBool(json, "rolledBack")}"),
+            _ => DescribeGenericResult(json)
+        };
+    }
+    catch
+    {
+        return "completed";
+    }
+}
+
+static string? DescribeGenericArguments(JsonElement? arguments)
+{
+    if (arguments is null || arguments.Value.ValueKind != JsonValueKind.Object) return null;
+
+    foreach (var name in new[] { "path", "service_name", "process_name", "app_name", "name" })
+    {
+        var value = SafeArg(arguments, name);
+        if (!string.IsNullOrWhiteSpace(value)) return Clip(value);
+    }
+
+    foreach (var name in new[] { "pid", "window_handle" })
+    {
+        var value = SafeLong(arguments, name);
+        if (value is not null) return $"{name}={value}";
+    }
+
+    return null;
+}
+
+static string DescribeGenericResult(JsonElement json)
+{
+    foreach (var name in new[] { "completed", "written", "cleared", "healthy", "ready", "stopped", "applied" })
+    {
+        var value = JsonBool(json, name);
+        if (value is not null) return $"{name}={value.Value.ToString().ToLowerInvariant()}";
+    }
+
+    foreach (var name in new[] { "count", "processId", "pid" })
+    {
+        var value = JsonLong(json, name);
+        if (value is not null) return $"{name}={value}";
+    }
+
+    return "completed";
+}
+
+static string? SafeArg(JsonElement? element, string propertyName)
+{
+    var property = GetProperty(element, propertyName);
+    if (property is null || property.Value.ValueKind != JsonValueKind.String) return null;
+    return property.Value.GetString();
+}
+
+static int SafeArrayCount(JsonElement? element, string propertyName)
+{
+    var property = GetProperty(element, propertyName);
+    return property is not null && property.Value.ValueKind == JsonValueKind.Array
+        ? property.Value.GetArrayLength()
+        : 0;
+}
+
+static bool? SafeBool(JsonElement? element, string propertyName)
+{
+    var property = GetProperty(element, propertyName);
+    if (property is null) return null;
+    return property.Value.ValueKind switch
+    {
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        _ => null
+    };
+}
+
+static int? SafeInt(JsonElement? element, string propertyName)
+{
+    var property = GetProperty(element, propertyName);
+    return property is not null
+        && property.Value.ValueKind == JsonValueKind.Number
+        && property.Value.TryGetInt32(out var value)
+            ? value
+            : null;
+}
+
+static long? SafeLong(JsonElement? element, string propertyName)
+{
+    var property = GetProperty(element, propertyName);
+    return property is not null
+        && property.Value.ValueKind == JsonValueKind.Number
+        && property.Value.TryGetInt64(out var value)
+            ? value
+            : null;
+}
+
+static string? JsonString(JsonElement element, string propertyName)
+{
+    return element.TryGetProperty(propertyName, out var property)
+        && property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : null;
+}
+
+static int JsonStringLength(JsonElement element, string propertyName)
+{
+    return JsonString(element, propertyName)?.Length ?? 0;
+}
+
+static long? JsonLong(JsonElement element, string propertyName)
+{
+    return element.TryGetProperty(propertyName, out var property)
+        && property.ValueKind == JsonValueKind.Number
+        && property.TryGetInt64(out var value)
+            ? value
+            : null;
+}
+
+static bool? JsonBool(JsonElement element, string propertyName)
+{
+    if (!element.TryGetProperty(propertyName, out var property)) return null;
+    return property.ValueKind switch
+    {
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        _ => null
+    };
+}
+
+static bool? JsonNestedBool(JsonElement element, string objectName, string propertyName)
+{
+    return element.TryGetProperty(objectName, out var nested) && nested.ValueKind == JsonValueKind.Object
+        ? JsonBool(nested, propertyName)
+        : null;
+}
+
+static string? SafeExecutable(string? executable)
+{
+    if (string.IsNullOrWhiteSpace(executable)) return null;
+    try { return Path.GetFileName(executable); }
+    catch { return Clip(executable, 50); }
+}
+
+static string? JoinDetail(params string?[] parts)
+{
+    var values = parts
+        .Where(static part => !string.IsNullOrWhiteSpace(part))
+        .Select(static part => part!.Trim())
+        .ToArray();
+    return values.Length == 0 ? null : string.Join(" | ", values);
+}
+
+static string? Clip(string? value, int max = 90)
+{
+    if (string.IsNullOrWhiteSpace(value)) return null;
+    var cleaned = value.Replace('\r', ' ').Replace('\n', ' ').Trim();
+    return cleaned.Length <= max ? cleaned : cleaned[..Math.Max(1, max - 3)] + "...";
+}
+
 
 static bool IsUnattended()
 {

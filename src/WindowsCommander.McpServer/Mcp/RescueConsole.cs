@@ -15,6 +15,7 @@ internal sealed class RescueConsole : IAsyncDisposable
     private readonly Channel<ActivityEvent> events;
     private readonly CancellationTokenSource lifetime = new();
     private readonly Task writerTask;
+    private long nextActivityId;
     private int active;
     private int queued;
 
@@ -22,8 +23,16 @@ internal sealed class RescueConsole : IAsyncDisposable
     {
         consoleEnabled = !Console.IsErrorRedirected || string.Equals(
             Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_ACTIVITY_CONSOLE"), "1", StringComparison.OrdinalIgnoreCase);
-        colorEnabled = consoleEnabled && !Console.IsErrorRedirected && !string.Equals(
-            Environment.GetEnvironmentVariable("NO_COLOR"), "1", StringComparison.OrdinalIgnoreCase);
+
+        // Raw ANSI sequences render as garbage in several Windows/tunnel hosts.
+        // Enable them only when explicitly requested; the dedicated dashboard
+        // uses native PowerShell console colors instead.
+        colorEnabled = consoleEnabled
+            && !Console.IsErrorRedirected
+            && string.Equals(
+                Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_ANSI"), "1", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(
+                Environment.GetEnvironmentVariable("NO_COLOR"), "1", StringComparison.OrdinalIgnoreCase);
 
         EventLogPath = ResolveEventLogPath();
         events = Channel.CreateBounded<ActivityEvent>(new BoundedChannelOptions(2048)
@@ -37,11 +46,12 @@ internal sealed class RescueConsole : IAsyncDisposable
 
     public string EventLogPath { get; }
 
-    public ActivityScope Queued(string lane, string operation, string? target = null)
+    public ActivityScope Queued(string lane, string operation, string? detail = null)
     {
+        var activityId = Interlocked.Increment(ref nextActivityId);
         Interlocked.Increment(ref queued);
-        Write("BLUE", "QUEUED", lane, operation, target, 0);
-        return new ActivityScope(this, lane, operation, target);
+        Write(activityId, "BLUE", "QUEUED", lane, operation, detail, 0);
+        return new ActivityScope(this, activityId, lane, operation, detail);
     }
 
     public object Snapshot() => new
@@ -50,47 +60,77 @@ internal sealed class RescueConsole : IAsyncDisposable
         queued = Volatile.Read(ref queued)
     };
 
-    private void Write(string color, string state, string lane, string operation, string? target, long elapsedMs)
+    private void Write(
+        long activityId,
+        string color,
+        string state,
+        string lane,
+        string operation,
+        string? detail,
+        long elapsedMs)
     {
         var prefix = colorEnabled ? Ansi(color) : string.Empty;
-        var reset = colorEnabled ? "[0m" : string.Empty;
-        var detail = string.IsNullOrWhiteSpace(target) ? string.Empty : $" | {target}";
+        var reset = colorEnabled ? "\u001b[0m" : string.Empty;
+        var suffix = string.IsNullOrWhiteSpace(detail) ? string.Empty : $" | {detail}";
+
         if (consoleEnabled)
         {
             lock (gate)
             {
-                Console.Error.WriteLine($"{prefix}[WC] {state,-16} {lane,-8} {elapsedMs,7} ms | {operation}{detail}{reset}");
+                Console.Error.WriteLine(
+                    $"{prefix}[WC] #{activityId,-5} {state,-9} {lane,-8} {elapsedMs,7} ms | {operation}{suffix}{reset}");
             }
         }
 
         _ = events.Writer.TryWrite(new ActivityEvent(
             DateTimeOffset.UtcNow,
+            activityId,
             state,
             lane,
             operation,
-            target,
+            detail,
             elapsedMs,
             Volatile.Read(ref active),
             Volatile.Read(ref queued)));
     }
 
-    private void Begin(string lane, string operation, string? target, Stopwatch stopwatch)
+    private void Begin(ActivityScope scope)
     {
         Interlocked.Decrement(ref queued);
         Interlocked.Increment(ref active);
-        Write("CYAN", "RUNNING", lane, operation, target, stopwatch.ElapsedMilliseconds);
+        Write(
+            scope.ActivityId,
+            "CYAN",
+            "RUNNING",
+            scope.Lane,
+            scope.Operation,
+            scope.RequestDetail,
+            scope.Stopwatch.ElapsedMilliseconds);
     }
 
-    private void End(string lane, string operation, string? target, Stopwatch stopwatch, Exception? error)
+    private void End(ActivityScope scope)
     {
         Interlocked.Decrement(ref active);
+
+        var detail = scope.Error is not null
+            ? Combine(scope.RequestDetail, $"ERROR: {scope.Error.Message}")
+            : Combine(scope.RequestDetail, scope.ResultDetail);
+
         Write(
-            error is null ? "GREEN" : "RED",
-            error is null ? "SUCCESS" : "FAILED",
-            lane,
-            operation,
-            error is null ? target : error.Message,
-            stopwatch.ElapsedMilliseconds);
+            scope.ActivityId,
+            scope.Error is null ? "GREEN" : "RED",
+            scope.Error is null ? "SUCCESS" : "FAILED",
+            scope.Lane,
+            scope.Operation,
+            detail,
+            scope.Stopwatch.ElapsedMilliseconds);
+    }
+
+    private static string? Combine(string? request, string? result)
+    {
+        if (string.IsNullOrWhiteSpace(request)) return result;
+        if (string.IsNullOrWhiteSpace(result)) return request;
+        return $"{request} => {result}";
     }
 
     private async Task WriteEventsAsync()
@@ -165,13 +205,13 @@ internal sealed class RescueConsole : IAsyncDisposable
 
     private static string Ansi(string color) => color switch
     {
-        "GREEN" => "[32m",
-        "CYAN" => "[36m",
-        "BLUE" => "[34m",
-        "YELLOW" => "[33m",
-        "MAGENTA" => "[35m",
-        "RED" => "[31m",
-        "GRAY" => "[90m",
+        "GREEN" => "\u001b[32m",
+        "CYAN" => "\u001b[36m",
+        "BLUE" => "\u001b[34m",
+        "YELLOW" => "\u001b[33m",
+        "MAGENTA" => "\u001b[35m",
+        "RED" => "\u001b[31m",
+        "GRAY" => "\u001b[90m",
         _ => string.Empty
     };
 
@@ -193,6 +233,7 @@ internal sealed class RescueConsole : IAsyncDisposable
 
     private sealed record ActivityEvent(
         DateTimeOffset Timestamp,
+        long ActivityId,
         string State,
         string Lane,
         string Operation,
@@ -204,50 +245,63 @@ internal sealed class RescueConsole : IAsyncDisposable
     internal sealed class ActivityScope : IDisposable
     {
         private readonly RescueConsole owner;
-        private readonly string lane;
-        private readonly string operation;
-        private readonly string? target;
-        private readonly Stopwatch stopwatch = Stopwatch.StartNew();
-        private Exception? error;
         private bool started;
         private bool disposed;
 
-        public ActivityScope(RescueConsole owner, string lane, string operation, string? target)
+        public ActivityScope(
+            RescueConsole owner,
+            long activityId,
+            string lane,
+            string operation,
+            string? requestDetail)
         {
             this.owner = owner;
-            this.lane = lane;
-            this.operation = operation;
-            this.target = target;
+            ActivityId = activityId;
+            Lane = lane;
+            Operation = operation;
+            RequestDetail = requestDetail;
         }
+
+        internal long ActivityId { get; }
+        internal string Lane { get; }
+        internal string Operation { get; }
+        internal string? RequestDetail { get; }
+        internal string? ResultDetail { get; private set; }
+        internal Exception? Error { get; private set; }
+        internal Stopwatch Stopwatch { get; } = Stopwatch.StartNew();
 
         public void MarkStarted()
         {
             if (started) return;
             started = true;
-            owner.Begin(lane, operation, target, stopwatch);
+            owner.Begin(this);
         }
 
-        public void MarkError(Exception exception) => error = exception;
+        public void MarkResult(string? detail) => ResultDetail = detail;
+
+        public void MarkError(Exception exception) => Error = exception;
 
         public void Dispose()
         {
             if (disposed) return;
             disposed = true;
-            stopwatch.Stop();
+            Stopwatch.Stop();
+
             if (!started)
             {
                 Interlocked.Decrement(ref owner.queued);
                 owner.Write(
-                    error is null ? "GRAY" : "RED",
-                    error is null ? "CANCELLED" : "FAILED",
-                    lane,
-                    operation,
-                    error?.Message ?? target,
-                    stopwatch.ElapsedMilliseconds);
+                    ActivityId,
+                    Error is null ? "GRAY" : "RED",
+                    Error is null ? "CANCELLED" : "FAILED",
+                    Lane,
+                    Operation,
+                    Error?.Message ?? RequestDetail,
+                    Stopwatch.ElapsedMilliseconds);
                 return;
             }
 
-            owner.End(lane, operation, target, stopwatch, error);
+            owner.End(this);
         }
     }
 }
