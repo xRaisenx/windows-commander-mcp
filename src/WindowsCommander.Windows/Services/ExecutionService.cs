@@ -82,6 +82,12 @@ public sealed class ExecutionService : IExecutionService
             stopwatch.Stop();
             return new CommandExecutionResult(string.Empty, "Process timed out.", null, stopwatch.Elapsed, TimedOut: true);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            TryKill(process);
+            stopwatch.Stop();
+            throw;
+        }
     }
 
     private static Process StartProcess(

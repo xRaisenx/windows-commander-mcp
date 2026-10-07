@@ -39,7 +39,7 @@ test harnesses on every change (`tools/smoke-mcp.ps1`, `tools/mutate-mcp.ps1`,
   Explorer, search files.
 - **Safety layer** — local Win32 confirmation dialog for high-risk tools,
   per-monitor pulsing border indicator, audio cue, activity-chip queue, and
-  an in-memory audit log with sensitive-argument redaction.
+  a bounded persistent audit log with sensitive-argument redaction.
 
 See [`docs/tool-coverage.md`](docs/tool-coverage.md) for the full per-tool
 list.
@@ -136,11 +136,21 @@ The safety layer is implemented and enabled by default.
   with a ⚠ marker. The overlay never activates, so it cannot steal focus.
   Recent actions render as a labelled chip queue along the glow's top edge.
 - **Audio cue** — short non-intrusive sound on every computer-use call.
-- **Audit log** — every tool invocation is recorded in memory with its risk
-  level; sensitive argument names (`password`, `token`, `secret`, `key`) are
-  redacted.
+- **Audit log** — every tool invocation is retained in a bounded in-memory view and
+  persisted as redacted JSONL so restart diagnostics survive MCP process loss. Sensitive
+  argument names (`password`, `token`, `secret`, `key`) are never persisted raw.
 
 See [`docs/safety.md`](docs/safety.md).
+
+## Tunnel reliability controls
+
+Long-running MCP calls are bounded before an upstream tunnel response deadline can expire. The default request budget is 90 seconds, and serialized text responses are capped at 512 KiB. Configure these only when the hosting transport has compatible limits:
+
+- `WINDOWS_COMMANDER_REQUEST_TIMEOUT_MS` - request budget, clamped to 5,000..110,000 ms.
+- `WINDOWS_COMMANDER_MAX_TEXT_RESULT_BYTES` - text response cap, clamped to 65,536..4,194,304 bytes.
+- `WINDOWS_COMMANDER_AUDIT_LOG` - persistent audit JSONL path; defaults to `%LOCALAPPDATA%\WindowsCommander\audit.jsonl`.
+
+For a process that must continue beyond the request budget, start it with `execute_process` and `wait_for_exit=false`, then inspect it with process tools instead of holding one MCP request open.
 
 ## Known Limitations
 
@@ -151,8 +161,7 @@ See [`docs/safety.md`](docs/safety.md).
 - `get_file_properties` returns metadata, version info, and hashes but does
   not yet include alternate data stream names or a security descriptor
   summary.
-- The audit log is in-memory only; persistent or exportable history is not
-  yet provided.
+- Persistent audit records intentionally contain redacted arguments only; sensitive values cannot be recovered after restart.
 
 ## Repository Layout
 
