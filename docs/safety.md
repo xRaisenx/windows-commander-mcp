@@ -16,7 +16,7 @@ Each tool call dispatched through the MCP server records:
 - Redacted arguments
 - Error summary, when applicable
 
-Audit history is currently in-memory and available through `get_operation_history`.
+Audit history is available through `get_operation_history` and is also persisted as bounded redacted JSONL so the operation immediately preceding an MCP restart remains diagnosable. The default path is `%LOCALAPPDATA%\WindowsCommander\audit.jsonl`; override it with `WINDOWS_COMMANDER_AUDIT_LOG`. Sensitive argument values are redacted before they are written to disk.
 
 ### Sensitive Argument Redaction
 
@@ -50,7 +50,6 @@ Medium-risk tools include computer-control, UI automation, shell launch, and win
 - WPF visual control indicators
 - Audio control cues
 - Indicator configuration tools
-- Persistent audit history
 - Policy configuration from file
 - Per-tool/action/path confirmation rules
 

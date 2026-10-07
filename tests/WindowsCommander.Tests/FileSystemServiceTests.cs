@@ -33,6 +33,46 @@ public class FileSystemServiceTests
     }
 
     [Fact]
+    public void ListDirectory_RespectsMaxResultsAndCancellation()
+    {
+        var service = new FileSystemService();
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "windows-commander-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            for (var index = 0; index < 5; index++)
+            {
+                File.WriteAllText(Path.Combine(tempDirectory, $"file-{index}.txt"), "x");
+            }
+
+            var entries = service.ListDirectory(
+                tempDirectory,
+                recursive: false,
+                includeHidden: false,
+                pattern: "*.txt",
+                maxResults: 2,
+                CancellationToken.None);
+
+            Assert.Equal(2, entries.Count);
+
+            using var cancelled = new CancellationTokenSource();
+            cancelled.Cancel();
+            Assert.Throws<OperationCanceledException>(() => service.ListDirectory(
+                tempDirectory,
+                recursive: true,
+                includeHidden: false,
+                pattern: "*",
+                maxResults: 1000,
+                cancelled.Token));
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void ListDirectory_ReturnsCreatedFile()
     {
         var service = new FileSystemService();
@@ -43,7 +83,13 @@ public class FileSystemServiceTests
 
         try
         {
-            var entries = service.ListDirectory(tempDirectory, recursive: false, includeHidden: false, pattern: "*.txt");
+            var entries = service.ListDirectory(
+                tempDirectory,
+                recursive: false,
+                includeHidden: false,
+                pattern: "*.txt",
+                maxResults: null,
+                CancellationToken.None);
 
             Assert.Contains(entries, entry => entry.Path == filePath && entry.Type == "file");
         }

@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Safety;
@@ -33,6 +34,12 @@ public sealed class ToolDispatcher
     // Pause after raising a capture target to the foreground so the desktop
     // compositor paints it before the capture reads the screen pixels.
     private const int CaptureForegroundSettleMs = 150;
+    private const int DefaultMaxTextResultBytes = 512 * 1024;
+    private static readonly int MaxTextResultBytes = GetBoundedEnvironmentInt(
+        "WINDOWS_COMMANDER_MAX_TEXT_RESULT_BYTES",
+        DefaultMaxTextResultBytes,
+        minimum: 64 * 1024,
+        maximum: 4 * 1024 * 1024);
 
     // Tools that actively drive the desktop (mouse, keyboard, windows, UI,
     // screen capture). A call to one of these plays the computer-use chime.
@@ -241,7 +248,8 @@ public sealed class ToolDispatcher
                     Str("path", "Directory path to list.", required: true),
                     Bool("recursive", "Recurse into subdirectories when true."),
                     Bool("include_hidden", "Include hidden and system entries when true."),
-                    Str("pattern", "Optional wildcard filename pattern, e.g. *.txt.")),
+                    Str("pattern", "Optional wildcard filename pattern, e.g. *.txt."),
+                    Int("max_results", "Maximum number of entries to return (default 1000, maximum 5000).")),
                 Tool("read_file", "Reads text or binary file content with encoding detection.",
                     Str("path", "File path to read.", required: true),
                     Str("encoding", "Text encoding name, e.g. utf-8, utf-16, ascii."),
@@ -361,6 +369,12 @@ public sealed class ToolDispatcher
             auditLog.Record(new AuditEntry(operationId, name, startedAt, DateTimeOffset.UtcNow, "success", args, null, risk));
 
             return ToToolResult(result);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            const string message = "Tool execution exceeded the MCP request deadline.";
+            auditLog.Record(new AuditEntry(operationId, name, startedAt, DateTimeOffset.UtcNow, "timeout", args, message, risk));
+            return ToErrorResult($"Tool '{name}' timed out before the MCP response deadline. Use a bounded query or start long-running processes asynchronously.");
         }
         catch (Exception exception)
         {
@@ -507,6 +521,15 @@ public sealed class ToolDispatcher
             };
         }
 
+        var text = JsonSerializer.Serialize(result, JsonOptions.Default);
+        var byteCount = Encoding.UTF8.GetByteCount(text);
+        if (byteCount > MaxTextResultBytes)
+        {
+            return ToErrorResult(
+                $"Tool result was {byteCount} bytes, exceeding the {MaxTextResultBytes}-byte MCP text-response limit. " +
+                "Narrow the query or use bounded options such as max_results/max_bytes.");
+        }
+
         return new
         {
             content = new[]
@@ -514,7 +537,7 @@ public sealed class ToolDispatcher
                 new
                 {
                     type = "text",
-                    text = JsonSerializer.Serialize(result, JsonOptions.Default)
+                    text
                 }
             }
         };
@@ -769,7 +792,9 @@ public sealed class ToolDispatcher
                 GetRequiredString(arguments, "path"),
                 GetBool(arguments, "recursive") ?? false,
                 GetBool(arguments, "include_hidden") ?? false,
-                GetString(arguments, "pattern")),
+                GetString(arguments, "pattern"),
+                GetInt(arguments, "max_results"),
+                cancellationToken),
             "read_file" => await fileSystemService.ReadFileAsync(
                 GetRequiredString(arguments, "path"),
                 GetString(arguments, "encoding"),
@@ -801,7 +826,8 @@ public sealed class ToolDispatcher
                 GetString(arguments, "name_pattern"),
                 GetString(arguments, "content_query"),
                 GetBool(arguments, "include_hidden") ?? false,
-                GetInt(arguments, "max_results")),
+                GetInt(arguments, "max_results"),
+                cancellationToken),
             _ => throw new ArgumentException($"Unknown filesystem tool: {name}")
         };
     }
@@ -1218,6 +1244,14 @@ public sealed class ToolDispatcher
         return value.EnumerateArray()
             .Select(item => item.ValueKind == JsonValueKind.String ? item.GetString() ?? string.Empty : throw new ArgumentException($"Argument contains a non-string value: {name}"))
             .ToArray();
+    }
+
+    private static int GetBoundedEnvironmentInt(string name, int defaultValue, int minimum, int maximum)
+    {
+        var raw = Environment.GetEnvironmentVariable(name);
+        return int.TryParse(raw, out var parsed)
+            ? Math.Clamp(parsed, minimum, maximum)
+            : defaultValue;
     }
 
     private static bool TryGetProperty(JsonElement? arguments, string name, out JsonElement value)

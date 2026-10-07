@@ -84,7 +84,13 @@ public interface IClipboardService
 
 public interface IFileSystemService
 {
-    IReadOnlyList<DirectoryEntry> ListDirectory(string path, bool recursive, bool includeHidden, string? pattern);
+    IReadOnlyList<DirectoryEntry> ListDirectory(
+        string path,
+        bool recursive,
+        bool includeHidden,
+        string? pattern,
+        int? maxResults,
+        CancellationToken cancellationToken);
 
     Task<FileReadResult> ReadFileAsync(string path, string? encoding, int? maxBytes, bool asBase64, CancellationToken cancellationToken);
 
@@ -105,7 +111,8 @@ public interface IFileSystemService
         string? namePattern,
         string? contentQuery,
         bool includeHidden,
-        int? maxResults);
+        int? maxResults,
+        CancellationToken cancellationToken);
 }
 
 public interface IShellService

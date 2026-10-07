@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 using System.Text;
 using System.Text.Json;
 using WindowsCommander.McpServer.Mcp;
@@ -11,6 +11,11 @@ using WindowsCommander.McpServer;
 // Setting WINDOWS_COMMANDER_UNATTENDED=1 disables the gate for automated
 // harness/CI runs that cannot answer a dialog.
 var requireConfirmation = !IsUnattended();
+var requestTimeoutMs = GetBoundedEnvironmentInt(
+    "WINDOWS_COMMANDER_REQUEST_TIMEOUT_MS",
+    defaultValue: 90_000,
+    minimum: 5_000,
+    maximum: 110_000);
 
 var dispatcher = new ToolDispatcher(
     new ProcessService(),
@@ -29,7 +34,7 @@ var dispatcher = new ToolDispatcher(
     new VisionService(),
     new UiAutomationService(),
     new ControlIndicatorService(),
-    new InMemoryAuditLog(),
+    new PersistentAuditLog(),
     new RiskPolicyService(),
     requireConfirmation);
 
@@ -82,10 +87,13 @@ while (await input.ReadLineAsync() is { } line)
                 }
             }),
             "tools/list" => JsonRpcResponse.Success(request.Id, dispatcher.ListTools()),
-            "tools/call" => JsonRpcResponse.Success(request.Id, await dispatcher.CallToolAsync(
-                GetRequiredString(request.Params, "name"),
-                GetProperty(request.Params, "arguments"),
-                CancellationToken.None)),
+            "tools/call" => JsonRpcResponse.Success(
+                request.Id,
+                await CallToolWithDeadlineAsync(
+                    dispatcher,
+                    GetRequiredString(request.Params, "name"),
+                    GetProperty(request.Params, "arguments"),
+                    requestTimeoutMs)),
             _ => JsonRpcResponse.Failure(request.Id, -32601, $"Method not found: {request.Method}")
         };
     }
@@ -105,10 +113,28 @@ while (await input.ReadLineAsync() is { } line)
     await output.FlushAsync();
 }
 
+static async Task<object> CallToolWithDeadlineAsync(
+    ToolDispatcher dispatcher,
+    string toolName,
+    JsonElement? arguments,
+    int requestTimeoutMs)
+{
+    using var deadline = new CancellationTokenSource(requestTimeoutMs);
+    return await dispatcher.CallToolAsync(toolName, arguments, deadline.Token);
+}
+
 static bool IsUnattended()
 {
     var value = Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_UNATTENDED");
     return value is "1" or "true" or "TRUE" or "True" or "yes";
+}
+
+static int GetBoundedEnvironmentInt(string name, int defaultValue, int minimum, int maximum)
+{
+    var raw = Environment.GetEnvironmentVariable(name);
+    return int.TryParse(raw, out var parsed)
+        ? Math.Clamp(parsed, minimum, maximum)
+        : defaultValue;
 }
 
 static string NegotiateProtocolVersion(JsonElement? requestParams)

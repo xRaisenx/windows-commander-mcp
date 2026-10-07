@@ -1,0 +1,7 @@
+{
+  "alias": "nmbv-windows-commander",
+  "tunnelId": "tunnel_REPLACE_WITH_WINDOWS_COMMANDER_TUNNEL_ID",
+  "runtimeApiKeyRef": "env:CONTROL_PLANE_API_KEY",
+  "tunnelClientPath": "D:\\path\\to\\tunnel-client.exe",
+  "executable": "D:/path/to/WindowsCommander.McpServer.exe"
+}
