@@ -126,33 +126,41 @@ function Stop-UnmanagedRawProfileOwners {
       })
   }
 
+  function Stop-RawOwnerAndWatchdog($Process) {
+    $parentId=[int]$Process.ParentProcessId
+    if($parentId -gt 0){
+      $parent=Get-CimInstance Win32_Process -Filter "ProcessId=$parentId" -ErrorAction SilentlyContinue
+      $parentName=[string]$parent.Name
+      if($parent -and $parentName -in @('cmd.exe','powershell.exe','pwsh.exe')){
+        # A raw Windows Commander profile launched from one of these shells can
+        # be a restart loop. Kill the dedicated parent immediately instead of
+        # waiting for the child to respawn and retake tunnel ownership.
+        Stop-Process -Id $parentId -Force -ErrorAction SilentlyContinue
+      }
+    }
+
+    Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+
   [array]$owners=Get-RawOwners
   if($owners.Count -eq 0){return}
 
-  $watchdogParents=@($owners | ForEach-Object { [int]$_.ParentProcessId } | Sort-Object -Unique)
   foreach($process in $owners){
-    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    Stop-RawOwnerAndWatchdog $process
   }
 
-  Start-Sleep -Milliseconds 350
-  [array]$respawned=Get-RawOwners
-  if($respawned.Count -gt 0){
-    foreach($process in $respawned){
-      $parentId=[int]$process.ParentProcessId
-      if($watchdogParents -contains $parentId){
-        $parent=Get-CimInstance Win32_Process -Filter "ProcessId=$parentId" -ErrorAction SilentlyContinue
-        $parentName=[string]$parent.Name
-        if($parentName -in @('cmd.exe','powershell.exe','pwsh.exe')){
-          Stop-Process -Id $parentId -Force -ErrorAction SilentlyContinue
-        }
-      }
-      Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-
-    Start-Sleep -Milliseconds 350
-  }
+  # Wait beyond the historical 2-second raw .cmd restart cadence.
+  Start-Sleep -Milliseconds 2500
 
   [array]$remaining=Get-RawOwners
+  if($remaining.Count -gt 0){
+    foreach($process in $remaining){
+      Stop-RawOwnerAndWatchdog $process
+    }
+    Start-Sleep -Milliseconds 1000
+    [array]$remaining=Get-RawOwners
+  }
+
   if($remaining.Count -gt 0){
     $pids=($remaining | ForEach-Object { $_.ProcessId }) -join ','
     throw "Unable to retire raw Windows Commander profile owner(s): $pids"
