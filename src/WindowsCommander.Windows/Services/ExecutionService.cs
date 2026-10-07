@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.IO;
+using System.Text;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Services;
 
@@ -6,6 +8,8 @@ namespace WindowsCommander.Windows.Services;
 
 public sealed class ExecutionService : IExecutionService
 {
+    private static readonly TimeSpan OutputDrainGrace = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan OutputDrainCancelGrace = TimeSpan.FromMilliseconds(250);
     public async Task<CommandExecutionResult> ExecutePowerShellAsync(
         string command,
         string? workingDirectory,
@@ -87,18 +91,25 @@ public sealed class ExecutionService : IExecutionService
         using var process = StartProcess(executablePath, arguments, workingDirectory, environment, redirectOutput: true);
         var processId = process.Id;
 
-        // Do not cancel the stream drains when the operation times out. Killing
-        // the owned process closes stdout/stderr, allowing us to preserve every
-        // byte the child produced before termination instead of returning empty
-        // evidence on the most important failure path.
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderrTask = process.StandardError.ReadToEndAsync();
+        // Read both pipes continuously while the direct child runs. A detached
+        // descendant may inherit those handles and keep them open after the
+        // direct child exits, so pipe EOF must never become an unbounded part
+        // of request completion.
+        using var drainSource = new CancellationTokenSource();
+        var stdoutBuffer = new StringBuilder();
+        var stderrBuffer = new StringBuilder();
+        var stdoutTask = DrainAsync(process.StandardOutput, stdoutBuffer, drainSource.Token);
+        var stderrTask = DrainAsync(process.StandardError, stderrBuffer, drainSource.Token);
 
         try
         {
             await process.WaitForExitAsync(linkedSource.Token);
-            var stdout = await stdoutTask;
-            var stderr = await stderrTask;
+            var (stdout, stderr) = await CompleteOutputCaptureAsync(
+                stdoutTask,
+                stderrTask,
+                stdoutBuffer,
+                stderrBuffer,
+                drainSource);
             stopwatch.Stop();
 
             return new CapturedExecution(
@@ -109,8 +120,12 @@ public sealed class ExecutionService : IExecutionService
         {
             TryKill(process);
             await WaitForKilledProcessAsync(process);
-            var stdout = await stdoutTask;
-            var stderr = await stderrTask;
+            var (stdout, stderr) = await CompleteOutputCaptureAsync(
+                stdoutTask,
+                stderrTask,
+                stdoutBuffer,
+                stderrBuffer,
+                drainSource);
             stopwatch.Stop();
 
             var timeoutMessage = string.IsNullOrWhiteSpace(stderr)
@@ -125,10 +140,89 @@ public sealed class ExecutionService : IExecutionService
         {
             TryKill(process);
             await WaitForKilledProcessAsync(process);
-            _ = await stdoutTask;
-            _ = await stderrTask;
+            _ = await CompleteOutputCaptureAsync(
+                stdoutTask,
+                stderrTask,
+                stdoutBuffer,
+                stderrBuffer,
+                drainSource);
             stopwatch.Stop();
             throw;
+        }
+    }
+
+    private static async Task DrainAsync(
+        StreamReader reader,
+        StringBuilder destination,
+        CancellationToken cancellationToken)
+    {
+        var buffer = new char[4096];
+
+        try
+        {
+            while (true)
+            {
+                var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken);
+                if (read == 0)
+                {
+                    return;
+                }
+
+                lock (destination)
+                {
+                    destination.Append(buffer, 0, read);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (IOException)
+        {
+        }
+    }
+
+    private static async Task<(string Stdout, string Stderr)> CompleteOutputCaptureAsync(
+        Task stdoutTask,
+        Task stderrTask,
+        StringBuilder stdoutBuffer,
+        StringBuilder stderrBuffer,
+        CancellationTokenSource drainSource)
+    {
+        var drains = Task.WhenAll(stdoutTask, stderrTask);
+
+        try
+        {
+            await drains.WaitAsync(OutputDrainGrace);
+        }
+        catch (TimeoutException)
+        {
+            drainSource.Cancel();
+
+            try
+            {
+                await drains.WaitAsync(OutputDrainCancelGrace);
+            }
+            catch (TimeoutException)
+            {
+                // A detached descendant can keep inherited stdout/stderr handles
+                // open even after cancellation. The direct process result is
+                // already terminal, so return the captured prefix instead of
+                // keeping the MCP request active indefinitely.
+            }
+        }
+
+        return (Snapshot(stdoutBuffer), Snapshot(stderrBuffer));
+    }
+
+    private static string Snapshot(StringBuilder buffer)
+    {
+        lock (buffer)
+        {
+            return buffer.ToString();
         }
     }
 

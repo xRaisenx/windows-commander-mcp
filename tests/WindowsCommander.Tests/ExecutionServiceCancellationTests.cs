@@ -69,4 +69,32 @@ public class ExecutionServiceCancellationTests
         Assert.Contains("before-timeout", result.StandardOutput);
         Assert.Contains("timed out", result.StandardError, StringComparison.OrdinalIgnoreCase);
     }
+    [Fact]
+    public async Task ExecuteProcessAsync_ParentExitDoesNotWaitForDetachedChildHoldingPipes()
+    {
+        var service = new ExecutionService();
+        var result = await service.ExecuteProcessAsync(
+            "pwsh.exe",
+            new[]
+            {
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Process -FilePath pwsh.exe -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 6' -NoNewWindow; Write-Output 'parent-done'"
+            },
+            workingDirectory: null,
+            timeoutMs: 10000,
+            waitForExit: true,
+            CancellationToken.None);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.False(result.TimedOut);
+        Assert.Contains("parent-done", result.StandardOutput, StringComparison.OrdinalIgnoreCase);
+        Assert.NotNull(result.ElapsedTime);
+        Assert.True(
+            result.ElapsedTime < TimeSpan.FromSeconds(3),
+            $"Expected the direct parent result without waiting for the detached child; elapsed={result.ElapsedTime}.");
+    }
+
 }
