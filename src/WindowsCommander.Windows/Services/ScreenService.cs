@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Windows.Forms;
 using System.Text;
 using WindowsCommander.Core.Models;
@@ -8,6 +9,7 @@ namespace WindowsCommander.Windows.Services;
 
 public sealed class ScreenService : IScreenService
 {
+    private static readonly ConcurrentDictionary<Guid, NotifyIcon> ActiveNotifications = new();
     public IReadOnlyList<ScreenDetails> GetScreenDetails()
     {
         return Screen.AllScreens
@@ -41,8 +43,8 @@ public sealed class ScreenService : IScreenService
                     screen.DeviceName,
                     $"{bounds.Width}x{bounds.Height}",
                     new RectBounds(bounds.X, bounds.Y, bounds.Width, bounds.Height),
-                    0,
-                    1.0);
+                    null,
+                    null);
             })
             .ToArray();
     }
@@ -89,16 +91,36 @@ public sealed class ScreenService : IScreenService
             throw new ArgumentException("Notification message must not be empty.", nameof(message));
         }
 
-        using var notifyIcon = new NotifyIcon
+        var duration = Math.Clamp(timeoutMs ?? 5000, 1000, 30000);
+        var notificationId = Guid.NewGuid();
+        var notifyIcon = new NotifyIcon
         {
             Icon = System.Drawing.SystemIcons.Information,
             Visible = true,
             BalloonTipTitle = title,
             BalloonTipText = message
         };
-        notifyIcon.ShowBalloonTip(Math.Clamp(timeoutMs ?? 5000, 1000, 30000));
+        ActiveNotifications[notificationId] = notifyIcon;
+        notifyIcon.ShowBalloonTip(duration);
 
-        return new NotificationResult(title, message, DateTimeOffset.UtcNow, Delivered: true);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(duration + 500);
+            }
+            finally
+            {
+                if (ActiveNotifications.TryRemove(notificationId, out var active))
+                {
+                    active.Visible = false;
+                    active.Dispose();
+                }
+            }
+        });
+
+        // Windows exposes request initiation, not user-visible delivery proof.
+        return new NotificationResult(title, message, DateTimeOffset.UtcNow, Delivered: null);
     }
 
     private static ScreenDetails ToDetails(Screen screen, int index)
@@ -113,12 +135,12 @@ public sealed class ScreenService : IScreenService
             screen.Primary,
             new RectBounds(bounds.X, bounds.Y, bounds.Width, bounds.Height),
             new RectBounds(workingArea.X, workingArea.Y, workingArea.Width, workingArea.Height),
-            1.0,
+            null,
             bounds.Width >= bounds.Height ? "Landscape" : "Portrait",
             $"{bounds.Width}x{bounds.Height}",
-            0,
-            0,
-            string.Empty,
+            null,
+            null,
+            null,
             true);
     }
 }
