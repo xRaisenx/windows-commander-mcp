@@ -76,11 +76,17 @@ public sealed class ExecutionService : IExecutionService
 
             return new CommandExecutionResult(stdout, stderr, process.ExitCode, stopwatch.Elapsed, TimedOut: false);
         }
-        catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
             TryKill(process);
             stopwatch.Stop();
-            return new CommandExecutionResult(string.Empty, "Process timed out.", null, stopwatch.Elapsed, TimedOut: true);
+
+            if (timeoutSource.IsCancellationRequested)
+            {
+                return new CommandExecutionResult(string.Empty, "Process timed out.", null, stopwatch.Elapsed, TimedOut: true);
+            }
+
+            throw;
         }
     }
 
