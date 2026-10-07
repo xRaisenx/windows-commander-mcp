@@ -24,7 +24,8 @@ public class ToolDispatcherReliabilityTests
             CancellationToken.None);
 
         var timedOutJson = JsonSerializer.Serialize(timedOut);
-        Assert.Contains(""isError":true", timedOutJson, StringComparison.Ordinal);
+        using var timedOutDocument = JsonDocument.Parse(timedOutJson);
+        Assert.True(timedOutDocument.RootElement.GetProperty("isError").GetBoolean());
         Assert.Contains("deadline", timedOutJson, StringComparison.OrdinalIgnoreCase);
 
         var next = await dispatcher.CallToolAsync(
@@ -33,7 +34,10 @@ public class ToolDispatcherReliabilityTests
             CancellationToken.None);
 
         var nextJson = JsonSerializer.Serialize(next);
-        Assert.DoesNotContain(""isError":true", nextJson, StringComparison.Ordinal);
+        using var nextDocument = JsonDocument.Parse(nextJson);
+        Assert.False(
+            nextDocument.RootElement.TryGetProperty("isError", out var nextIsError)
+            && nextIsError.GetBoolean());
     }
 
     [Fact]
@@ -62,7 +66,8 @@ public class ToolDispatcherReliabilityTests
                 CancellationToken.None);
 
             var oversizedJson = JsonSerializer.Serialize(oversized);
-            Assert.Contains(""isError":true", oversizedJson, StringComparison.Ordinal);
+            using var oversizedDocument = JsonDocument.Parse(oversizedJson);
+            Assert.True(oversizedDocument.RootElement.GetProperty("isError").GetBoolean());
             Assert.Contains("response budget", oversizedJson, StringComparison.OrdinalIgnoreCase);
 
             var next = await dispatcher.CallToolAsync(
@@ -71,7 +76,10 @@ public class ToolDispatcherReliabilityTests
                 CancellationToken.None);
 
             var nextJson = JsonSerializer.Serialize(next);
-            Assert.DoesNotContain(""isError":true", nextJson, StringComparison.Ordinal);
+            using var nextDocument = JsonDocument.Parse(nextJson);
+            Assert.False(
+                nextDocument.RootElement.TryGetProperty("isError", out var nextIsError)
+                && nextIsError.GetBoolean());
         }
         finally
         {
