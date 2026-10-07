@@ -29,6 +29,7 @@ var maxRequestBytes = GetBoundedEnvironmentInt(
     maximum: 8 * 1024 * 1024);
 
 var rescueConsole = new RescueConsole();
+var processOperations = new ProcessOperationSupervisor(Math.Min(2, maxConcurrency));
 var serverUptime = Stopwatch.StartNew();
 Func<object> runtimeStatusProvider = () => CreateRuntimeStatus(
     rescueConsole,
@@ -59,7 +60,8 @@ var dispatcher = new ToolDispatcher(
     new PersistentAuditLog(),
     new RiskPolicyService(),
     requireConfirmation,
-    runtimeStatusProvider);
+    runtimeStatusProvider,
+    processOperations);
 using var globalConcurrency = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 using var desktopLane = new SemaphoreSlim(1, 1);
 using var processLane = new SemaphoreSlim(Math.Min(2, maxConcurrency), Math.Min(2, maxConcurrency));
@@ -336,7 +338,7 @@ static string ClassifyLane(string toolName)
             or "clipboard_access" => "DESKTOP",
 
         "execute_process" or "execute_powershell" or "manage_process"
-            or "launch_app" => "PROCESS",
+            or "launch_app" or "start_process_operation" or "cancel_process_operation" => "PROCESS",
 
         "write_file" or "copy_move_delete_path" or "environment_variable"
             => "MUTATE",
