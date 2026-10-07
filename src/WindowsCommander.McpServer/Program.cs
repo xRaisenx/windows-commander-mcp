@@ -11,6 +11,19 @@ using WindowsCommander.McpServer;
 // Setting WINDOWS_COMMANDER_UNATTENDED=1 disables the gate for automated
 // harness/CI runs that cannot answer a dialog.
 var requireConfirmation = !IsUnattended();
+var toolCallTimeout = TimeSpan.FromMilliseconds(ReadBoundedIntEnvironment(
+    "WINDOWS_COMMANDER_TOOL_TIMEOUT_MS",
+    defaultValue: 90_000,
+    minimum: 5_000,
+    maximum: 100_000));
+var maxResponseBytes = ReadBoundedIntEnvironment(
+    "WINDOWS_COMMANDER_MAX_RESPONSE_BYTES",
+    defaultValue: 4 * 1024 * 1024,
+    minimum: 64 * 1024,
+    maximum: 16 * 1024 * 1024);
+var auditPath = Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_AUDIT_LOG");
+var auditLog = new PersistentAuditLog(
+    string.IsNullOrWhiteSpace(auditPath) ? PersistentAuditLog.GetDefaultPath() : auditPath);
 
 var dispatcher = new ToolDispatcher(
     new ProcessService(),
@@ -29,9 +42,11 @@ var dispatcher = new ToolDispatcher(
     new VisionService(),
     new UiAutomationService(),
     new ControlIndicatorService(),
-    new InMemoryAuditLog(),
+    auditLog,
     new RiskPolicyService(),
-    requireConfirmation);
+    requireConfirmation,
+    toolCallTimeout,
+    maxResponseBytes);
 
 // The MCP stdio transport is strictly UTF-8. Bind explicit UTF-8 (no BOM)
 // streams so non-ASCII characters survive regardless of the host code page;
@@ -103,6 +118,14 @@ while (await input.ReadLineAsync() is { } line)
 
     await output.WriteLineAsync(JsonSerializer.Serialize(response, JsonOptions.Default));
     await output.FlushAsync();
+}
+
+static int ReadBoundedIntEnvironment(string name, int defaultValue, int minimum, int maximum)
+{
+    var value = Environment.GetEnvironmentVariable(name);
+    return int.TryParse(value, out var parsed)
+        ? Math.Clamp(parsed, minimum, maximum)
+        : defaultValue;
 }
 
 static bool IsUnattended()
