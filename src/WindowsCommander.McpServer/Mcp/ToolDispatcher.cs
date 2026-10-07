@@ -3,6 +3,7 @@ using System.Text.Json;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Safety;
 using WindowsCommander.Core.Services;
+using WindowsCommander.McpServer;
 
 namespace WindowsCommander.McpServer.Mcp;
 
