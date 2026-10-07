@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
+using WindowsCommander.Windows.Services;
 
 namespace WindowsCommander.McpServer.Mcp;
 
@@ -98,6 +99,8 @@ public sealed class ProcessOperationSupervisor
             {
                 startInfo.WorkingDirectory = operation.WorkingDirectory;
             }
+
+            _ = ChildEnvironmentSanitizer.ApplyTo(startInfo);
 
             using var process = Process.Start(startInfo)
                 ?? throw new InvalidOperationException($"Failed to start process: {operation.ExecutablePath}");
