@@ -1,3 +1,4 @@
+using System.IO;
 namespace WindowsCommander.Windows.Services;
 
 internal sealed class PathMutationLock

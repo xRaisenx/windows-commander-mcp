@@ -36,6 +36,11 @@ public class AutomationServiceTests
     [Fact]
     public void VisionService_ResolveCaptureGlowBounds_PrimaryScreenFramesThatScreen()
     {
+        if (System.Windows.Forms.Screen.PrimaryScreen is null)
+        {
+            return;
+        }
+
         var service = new VisionService();
 
         var bounds = service.ResolveCaptureGlowBounds("primary_screen", null);

@@ -13,14 +13,10 @@ namespace WindowsCommander.Windows.Services;
 
 public sealed class VisionService : IVisionService
 {
-    // Caps the longest side of a returned capture so payloads stay small enough
-    // to be usable; an explicit max_dimension argument can override this.
     private const int DefaultMaxDimension = 1400;
     private const int MaximumMaxDimension = 4096;
     private const long MaximumSourcePixels = 80_000_000;
 
-    // The Windows on-device OCR engine, created lazily from the user's
-    // installed languages and reused across calls.
     private WinRtOcr.OcrEngine? ocrEngine;
 
     public ScreenCaptureResult CaptureScreen(string target, long? windowHandle, int? maxDimension)
@@ -42,31 +38,25 @@ public sealed class VisionService : IVisionService
     public async Task<OcrResult> OcrScreenAsync(string target, long? windowHandle, RectBounds? region)
     {
         var resolvedRegion = region ?? ResolveCaptureRegion(target, windowHandle);
-        if (resolvedRegion.Width <= 0 || resolvedRegion.Height <= 0)
-        {
-            throw new ArgumentException("OCR region width and height must be greater than zero.");
-        }
-
         ValidateSourceRegion(resolvedRegion);
-        var engine = GetOcrEngine();
 
-        // Capture only after validating the source allocation budget.
+        var engine = GetOcrEngine();
         using var bitmap = new System.Drawing.Bitmap(resolvedRegion.Width, resolvedRegion.Height);
         using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
         {
-            graphics.CopyFromScreen(resolvedRegion.X, resolvedRegion.Y, 0, 0, new System.Drawing.Size(resolvedRegion.Width, resolvedRegion.Height));
+            graphics.CopyFromScreen(
+                resolvedRegion.X,
+                resolvedRegion.Y,
+                0,
+                0,
+                new System.Drawing.Size(resolvedRegion.Width, resolvedRegion.Height));
         }
 
-        // OcrEngine rejects images longer than MaxImageDimension on a side.
-        // Scale down to fit and divide the result rects back up by the factor.
         var maxDimension = (int)WinRtOcr.OcrEngine.MaxImageDimension;
         var longestSide = Math.Max(bitmap.Width, bitmap.Height);
         var scale = longestSide > maxDimension ? (double)maxDimension / longestSide : 1.0;
 
-        var softwareBitmap = scale < 1.0
-            ? await ToSoftwareBitmapAsync(bitmap, scale)
-            : await ToSoftwareBitmapAsync(bitmap, 1.0);
-
+        var softwareBitmap = await ToSoftwareBitmapAsync(bitmap, scale);
         try
         {
             var recognized = await engine.RecognizeAsync(softwareBitmap);
@@ -91,8 +81,6 @@ public sealed class VisionService : IVisionService
                 "No OCR language pack is available. Add one via Settings > Time & language > Language & region.");
     }
 
-    // Renders a GDI bitmap (optionally scaled) into the BGRA8 SoftwareBitmap
-    // the OCR engine expects.
     private static async Task<SoftwareBitmap> ToSoftwareBitmapAsync(System.Drawing.Bitmap bitmap, double scale)
     {
         byte[] bytes;
@@ -125,7 +113,8 @@ public sealed class VisionService : IVisionService
         stream.Seek(0);
         var decoder = await BitmapDecoder.CreateAsync(stream);
         var decoded = await decoder.GetSoftwareBitmapAsync();
-        if (decoded.BitmapPixelFormat == BitmapPixelFormat.Bgra8 && decoded.BitmapAlphaMode == BitmapAlphaMode.Premultiplied)
+        if (decoded.BitmapPixelFormat == BitmapPixelFormat.Bgra8
+            && decoded.BitmapAlphaMode == BitmapAlphaMode.Premultiplied)
         {
             return decoded;
         }
@@ -135,8 +124,6 @@ public sealed class VisionService : IVisionService
         return converted;
     }
 
-    // Collapses an OCR line into a text block, mapping its bitmap-relative
-    // bounds back into virtual-screen coordinates.
     private static OcrTextBlock? ToBlock(WinRtOcr.OcrLine line, RectBounds region, double scale)
     {
         if (line.Words.Count == 0)
@@ -154,20 +141,20 @@ public sealed class VisionService : IVisionService
             maxY = Math.Max(maxY, rect.Y + rect.Height);
         }
 
-        // Rects are relative to the (possibly scaled) captured bitmap: undo the
-        // scale, then offset by the region origin to reach screen coordinates.
         var bounds = new RectBounds(
             region.X + (int)Math.Round(minX / scale),
             region.Y + (int)Math.Round(minY / scale),
             (int)Math.Round((maxX - minX) / scale),
             (int)Math.Round((maxY - minY) / scale));
 
-        // Windows.Media.Ocr does not expose a per-line confidence score.
-        // Unknown is more accurate than fabricated certainty.
         return new OcrTextBlock(line.Text, null, bounds);
     }
 
-    public VisualDetectionResult DetectVisualElements(string target, long? windowHandle, RectBounds? region, IReadOnlyList<string>? elementTypes)
+    public VisualDetectionResult DetectVisualElements(
+        string target,
+        long? windowHandle,
+        RectBounds? region,
+        IReadOnlyList<string>? elementTypes)
     {
         var resolvedRegion = region ?? ResolveCaptureRegion(target, windowHandle);
         var requestedTypes = elementTypes is null || elementTypes.Count == 0
@@ -184,32 +171,16 @@ public sealed class VisionService : IVisionService
 
     public RectBounds? ResolveCaptureGlowBounds(string target, long? windowHandle)
     {
-        // full_screen grabs the whole virtual desktop; let the caller frame
-        // each monitor individually rather than one oversized rectangle.
         if (target.Equals("full_screen", StringComparison.OrdinalIgnoreCase))
         {
             return null;
         }
 
-        var region = ResolveCaptureRegion(target, windowHandle);
-
-        // active_window falls back to full_screen when the foreground window
-        // cannot be resolved; treat that virtual-desktop-sized result as null
-        // too so the glow does not stretch across every screen as one rect.
-        var virtualScreen = SystemInformation.VirtualScreen;
-        if (region.X == virtualScreen.X && region.Y == virtualScreen.Y
-            && region.Width == virtualScreen.Width && region.Height == virtualScreen.Height)
-        {
-            return null;
-        }
-
-        return region;
+        return ResolveCaptureRegion(target, windowHandle);
     }
 
     public long? TryResolveCaptureWindowHandle(string target, long? windowHandle)
     {
-        // An explicit hwnd wins, exactly as ResolveCaptureRegion resolves the
-        // pixels we are about to grab; a bare numeric target names a window too.
         if (windowHandle is not null)
         {
             return windowHandle;
@@ -220,14 +191,13 @@ public sealed class VisionService : IVisionService
             return parsed;
         }
 
-        // full_screen / primary_screen / screen-N name no single window, and
-        // active_window is already the foreground — nothing to raise.
         return null;
     }
 
     private static ScreenCaptureResult CaptureRegion(RectBounds region, string? monitorId, int? maxDimension)
     {
         ValidateSourceRegion(region);
+
         using var bitmap = new System.Drawing.Bitmap(region.Width, region.Height);
         using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
         {
@@ -262,10 +232,6 @@ public sealed class VisionService : IVisionService
             return new RectBounds(bounds.X, bounds.Y, bounds.Width, bounds.Height);
         }
 
-        // Per-monitor capture options exist because "full_screen" grabs the
-        // whole virtual screen — on multi-monitor setups that can be ~8000px
-        // wide, and downscaling it to fit the payload cap renders all text
-        // unreadable. Capturing a single monitor keeps the result legible.
         if (target.Equals("primary_screen", StringComparison.OrdinalIgnoreCase))
         {
             var primary = Screen.PrimaryScreen ?? throw new ArgumentException("No primary screen is available.");
@@ -279,7 +245,8 @@ public sealed class VisionService : IVisionService
             var screens = Screen.AllScreens;
             if (screenNumber < 1 || screenNumber > screens.Length)
             {
-                throw new ArgumentException($"Screen index out of range: '{target}'. Valid range is screen-1 to screen-{screens.Length}.");
+                throw new ArgumentException(
+                    $"Screen index out of range: '{target}'. Valid range is screen-1 to screen-{screens.Length}.");
             }
 
             var bounds = screens[screenNumber - 1].Bounds;
@@ -288,11 +255,10 @@ public sealed class VisionService : IVisionService
 
         if (target.Equals("active_window", StringComparison.OrdinalIgnoreCase))
         {
-            // The real foreground window — not just the first title-bearing
-            // window in z-order. Never broaden an active-window request into a
-            // full-desktop capture when the target cannot be resolved.
             var foreground = NativeMethods.GetForegroundWindow();
-            if (foreground != IntPtr.Zero && IsWindow(foreground) && NativeMethods.GetWindowRect(foreground, out var rect))
+            if (foreground != IntPtr.Zero
+                && IsWindow(foreground)
+                && NativeMethods.GetWindowRect(foreground, out var rect))
             {
                 return new RectBounds(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
             }
@@ -307,7 +273,8 @@ public sealed class VisionService : IVisionService
 
         if (windowHandle is not null)
         {
-            if (!NativeMethods.GetWindowRect(new IntPtr(windowHandle.Value), out var rect))
+            var handle = new IntPtr(windowHandle.Value);
+            if (!IsWindow(handle) || !NativeMethods.GetWindowRect(handle, out var rect))
             {
                 throw new ArgumentException($"Window handle was not found: {windowHandle}");
             }
@@ -328,8 +295,9 @@ public sealed class VisionService : IVisionService
         var pixels = (long)region.Width * region.Height;
         if (pixels > MaximumSourcePixels)
         {
-            throw new ArgumentOutOfRangeException(nameof(region),
-                $"Capture source contains {pixels:N0} pixels; maximum is {MaximumSourcePixels:N0}. Capture a smaller region or monitor.");
+            throw new ArgumentOutOfRangeException(
+                nameof(region),
+                $"Capture source contains {pixels:N0} pixels; maximum is {MaximumSourcePixels:N0}.");
         }
     }
 

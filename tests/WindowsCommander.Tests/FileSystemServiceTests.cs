@@ -150,4 +150,68 @@ public class FileSystemServiceTests
             Directory.Delete(tempDirectory, recursive: true);
         }
     }
-}
+
+    [Fact]
+    public async Task WriteFileAsync_PreservesUtf8BomWhenEncodingIsNotSpecified()
+    {
+        var service = new FileSystemService();
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "windows-commander-tests", Guid.NewGuid().ToString("N"));
+        var filePath = Path.Combine(tempDirectory, "bom.txt");
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            await File.WriteAllTextAsync(filePath, "before", new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            var properties = await service.GetFilePropertiesAsync(filePath, "SHA256", CancellationToken.None);
+
+            await service.WriteFileAsync(
+                filePath,
+                "after",
+                encoding: null,
+                overwrite: true,
+                createDirectories: false,
+                expectedSha256: properties.Hash,
+                CancellationToken.None);
+
+            var bytes = await File.ReadAllBytesAsync(filePath);
+            Assert.True(bytes.Length >= 3);
+            Assert.Equal(0xEF, bytes[0]);
+            Assert.Equal(0xBB, bytes[1]);
+            Assert.Equal(0xBF, bytes[2]);
+            Assert.Equal("after", await File.ReadAllTextAsync(filePath));
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SearchFiles_ContentSearchReturnsMatchingFile()
+    {
+        var service = new FileSystemService();
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "windows-commander-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var wanted = Path.Combine(tempDirectory, "wanted.txt");
+            File.WriteAllText(wanted, "lightning-rescue-marker");
+            File.WriteAllText(Path.Combine(tempDirectory, "other.txt"), "unrelated");
+
+            var results = service.SearchFiles(
+                new[] { tempDirectory },
+                "*.txt",
+                "lightning-rescue-marker",
+                includeHidden: false,
+                maxResults: 10,
+                CancellationToken.None);
+
+            Assert.Single(results);
+            Assert.Equal(wanted, results[0].Path);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }}

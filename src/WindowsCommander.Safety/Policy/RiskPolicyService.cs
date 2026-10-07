@@ -14,6 +14,9 @@ public sealed class RiskPolicyService : IRiskPolicyService
         "execute_process",
         "start_process_operation",
         "cancel_process_operation",
+        "codeintel_start",
+        "codeintel_replace_symbol",
+        "serena_rescue_restart",
         "request_user_confirmation"
     };
 

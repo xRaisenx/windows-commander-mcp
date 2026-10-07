@@ -1,3 +1,4 @@
+using System.IO;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
@@ -94,6 +95,7 @@ internal sealed class LspClient : IAsyncDisposable
     {
         var fullPath = Path.GetFullPath(path);
         var text = await File.ReadAllTextAsync(fullPath, cancellationToken);
+        diagnostics.TryRemove(new Uri(fullPath).AbsoluteUri, out _);
         await NotifyAsync("textDocument/didOpen", new
         {
             textDocument = new
@@ -109,6 +111,7 @@ internal sealed class LspClient : IAsyncDisposable
     public async Task ChangeDocumentAsync(string path, string languageId, string text, CancellationToken cancellationToken)
     {
         var fullPath = Path.GetFullPath(path);
+        diagnostics.TryRemove(new Uri(fullPath).AbsoluteUri, out _);
         await NotifyAsync("textDocument/didChange", new
         {
             textDocument = new
@@ -126,6 +129,16 @@ internal sealed class LspClient : IAsyncDisposable
             textDocument = new { uri = new Uri(Path.GetFullPath(path)).AbsoluteUri }
         }, TimeSpan.FromSeconds(15), cancellationToken);
 
+    public Task<JsonElement> DefinitionAsync(
+        string path,
+        int line,
+        int character,
+        CancellationToken cancellationToken)
+        => RequestAsync("textDocument/definition", new
+        {
+            textDocument = new { uri = new Uri(Path.GetFullPath(path)).AbsoluteUri },
+            position = new { line, character }
+        }, TimeSpan.FromSeconds(15), cancellationToken);
     public Task<JsonElement> ReferencesAsync(
         string path,
         int line,

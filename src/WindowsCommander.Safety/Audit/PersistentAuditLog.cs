@@ -1,6 +1,5 @@
 using System.IO;
 using System.Text.Json;
-using System.Threading.Channels;
 using WindowsCommander.Core.Safety;
 
 namespace WindowsCommander.Safety.Audit;
@@ -9,6 +8,7 @@ public sealed class PersistentAuditLog : IAuditLog
 {
     private const long CompactThresholdBytes = 4L * 1024L * 1024L;
     private const string RedactedValue = "***REDACTED***";
+
     private static readonly HashSet<string> AlwaysRedactedKeys = new(StringComparer.OrdinalIgnoreCase)
     {
         "arguments",
@@ -28,8 +28,6 @@ public sealed class PersistentAuditLog : IAuditLog
     private readonly object gate = new();
     private readonly object persistenceGate = new();
     private readonly Queue<AuditEntry> entries = new();
-    private readonly Channel<AuditEntry> persistenceQueue;
-    private readonly Task persistenceWorker;
     private readonly int capacity;
     private readonly string path;
 
@@ -37,15 +35,7 @@ public sealed class PersistentAuditLog : IAuditLog
     {
         this.capacity = Math.Max(1, capacity);
         this.path = ResolvePath(path);
-        persistenceQueue = Channel.CreateBounded<AuditEntry>(new BoundedChannelOptions(Math.Max(256, this.capacity * 2))
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            FullMode = BoundedChannelFullMode.Wait
-        });
-
         LoadExisting();
-        persistenceWorker = Task.Run(PersistenceLoopAsync);
     }
 
     public string Path => path;
@@ -59,22 +49,7 @@ public sealed class PersistentAuditLog : IAuditLog
         }
 
         var persisted = entry with { RedactedArguments = Redact(entry.RedactedArguments) };
-
-        // High-risk mutations pay the small durability cost synchronously.
-        // Ordinary reads and medium-risk operations leave file I/O/compaction
-        // off the request hot path.
-        if (entry.Risk == RiskLevel.High)
-        {
-            PersistOne(persisted);
-            return;
-        }
-
-        if (!persistenceQueue.Writer.TryWrite(persisted))
-        {
-            // Backpressure must not silently lose audit evidence. A saturated
-            // queue falls back to synchronous persistence rather than dropping.
-            PersistOne(persisted);
-        }
+        PersistOne(persisted);
     }
 
     public IReadOnlyList<AuditEntry> GetRecent(int limit, bool includeSensitiveArguments)
@@ -91,14 +66,6 @@ public sealed class PersistentAuditLog : IAuditLog
         }
     }
 
-    private async Task PersistenceLoopAsync()
-    {
-        await foreach (var entry in persistenceQueue.Reader.ReadAllAsync())
-        {
-            PersistOne(entry);
-        }
-    }
-
     private void PersistOne(AuditEntry persisted)
     {
         lock (persistenceGate)
@@ -110,7 +77,6 @@ public sealed class PersistentAuditLog : IAuditLog
                 {
                     Directory.CreateDirectory(directory);
                 }
-
                 File.AppendAllText(path, JsonSerializer.Serialize(persisted) + Environment.NewLine);
 
                 if (new FileInfo(path).Length > CompactThresholdBytes)
@@ -191,15 +157,15 @@ public sealed class PersistentAuditLog : IAuditLog
 
     private static string ResolvePath(string? configuredPath)
     {
-        var path = configuredPath;
-        if (string.IsNullOrWhiteSpace(path))
+        var candidate = configuredPath;
+        if (string.IsNullOrWhiteSpace(candidate))
         {
-            path = Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_AUDIT_LOG");
+            candidate = Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_AUDIT_LOG");
         }
 
-        if (!string.IsNullOrWhiteSpace(path))
+        if (!string.IsNullOrWhiteSpace(candidate))
         {
-            return System.IO.Path.GetFullPath(Environment.ExpandEnvironmentVariables(path));
+            return System.IO.Path.GetFullPath(Environment.ExpandEnvironmentVariables(candidate));
         }
 
         return System.IO.Path.Combine(

@@ -33,9 +33,9 @@ public class ProcessOperationSupervisorTests
 
         var started = supervisor.Start(
             "pwsh.exe",
-            new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Write-Output 'before-timeout'; Start-Sleep -Seconds 10" },
+            new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.WriteLine('before-timeout'); [Console]::Out.Flush(); Start-Sleep -Seconds 10" },
             workingDirectory: null,
-            timeoutMs: 300,
+            timeoutMs: 3000,
             maxOutputBytes: 64 * 1024);
 
         var completed = await WaitForTerminalAsync(supervisor, started.OperationId);

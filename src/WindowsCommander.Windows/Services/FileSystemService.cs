@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
@@ -119,7 +120,7 @@ public sealed class FileSystemService : IFileSystemService
             await VerifyExpectedSha256Async(fullPath, expectedSha256, cancellationToken);
         }
 
-        var bytes = ResolveEncoding(encoding).GetBytes(content);
+        var bytes = await EncodeForWriteAsync(fullPath, content, encoding, cancellationToken);
         var tempPath = CreateSiblingTemporaryPath(fullPath, "write");
         try
         {
@@ -219,6 +220,12 @@ public sealed class FileSystemService : IFileSystemService
         CancellationToken cancellationToken)
     {
         var limit = Math.Clamp(maxResults ?? 100, 1, 1000);
+        if (!string.IsNullOrWhiteSpace(contentQuery)
+            && TrySearchWithRipgrep(roots, namePattern, contentQuery, includeHidden, limit, cancellationToken, out var accelerated))
+        {
+            return accelerated;
+        }
+
         var results = new List<FileSearchResult>(limit);
 
         foreach (var root in roots)
@@ -264,6 +271,121 @@ public sealed class FileSystemService : IFileSystemService
         return results;
     }
 
+    private static bool TrySearchWithRipgrep(
+        IReadOnlyList<string> roots,
+        string? namePattern,
+        string contentQuery,
+        bool includeHidden,
+        int limit,
+        CancellationToken cancellationToken,
+        out IReadOnlyList<FileSearchResult> results)
+    {
+        var found = new List<FileSearchResult>(limit);
+        try
+        {
+            foreach (var root in roots)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (found.Count >= limit)
+                {
+                    break;
+                }
+
+                var rootPath = NormalizeExistingDirectory(root);
+                var startInfo = new ProcessStartInfo("rg")
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WorkingDirectory = rootPath
+                };
+
+                startInfo.ArgumentList.Add("--files-with-matches");
+                startInfo.ArgumentList.Add("--fixed-strings");
+                startInfo.ArgumentList.Add("--ignore-case");
+                startInfo.ArgumentList.Add("--no-ignore");
+                startInfo.ArgumentList.Add("--text");
+                startInfo.ArgumentList.Add("--no-messages");
+                if (includeHidden)
+                {
+                    startInfo.ArgumentList.Add("--hidden");
+                }
+
+                if (!string.IsNullOrWhiteSpace(namePattern))
+                {
+                    startInfo.ArgumentList.Add("--glob");
+                    startInfo.ArgumentList.Add(namePattern);
+                }
+
+                startInfo.ArgumentList.Add("--");
+                startInfo.ArgumentList.Add(contentQuery);
+                startInfo.ArgumentList.Add(rootPath);
+
+                using var process = Process.Start(startInfo);
+                if (process is null)
+                {
+                    results = Array.Empty<FileSearchResult>();
+                    return false;
+                }
+
+                while (found.Count < limit)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var line = process.StandardOutput.ReadLineAsync(cancellationToken).AsTask().GetAwaiter().GetResult();
+                    if (line is null)
+                    {
+                        break;
+                    }
+
+                    var candidate = Path.IsPathRooted(line)
+                        ? Path.GetFullPath(line)
+                        : Path.GetFullPath(Path.Combine(rootPath, line));
+                    if (!File.Exists(candidate))
+                    {
+                        continue;
+                    }
+
+                    var info = new FileInfo(candidate);
+                    if (!includeHidden
+                        && (info.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0)
+                    {
+                        continue;
+                    }
+
+                    found.Add(new FileSearchResult(info.FullName, "file", info.Length, info.LastWriteTimeUtc));
+                }
+
+                if (found.Count >= limit && !process.HasExited)
+                {
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                }
+
+                if (!process.WaitForExit(2000))
+                {
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                }
+
+                if (process.HasExited && process.ExitCode > 1)
+                {
+                    results = Array.Empty<FileSearchResult>();
+                    return false;
+                }
+            }
+
+            results = found;
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is Win32Exception
+            or IOException
+            or InvalidOperationException
+            or UnauthorizedAccessException)
+        {
+            results = Array.Empty<FileSearchResult>();
+            return false;
+        }
+    }
     private static DirectoryEntry ToDirectoryEntry(FileSystemInfo info)
     {
         var fileInfo = info as FileInfo;
@@ -334,6 +456,96 @@ public sealed class FileSystemService : IFileSystemService
         return new string(chars, 0, charsUsed);
     }
 
+    private static async Task<byte[]> EncodeForWriteAsync(
+        string fullPath,
+        string content,
+        string? requestedEncoding,
+        CancellationToken cancellationToken)
+    {
+        var includePreamble = false;
+        Encoding encoding;
+
+        if (!string.IsNullOrWhiteSpace(requestedEncoding))
+        {
+            if (requestedEncoding.Equals("utf-8-bom", StringComparison.OrdinalIgnoreCase))
+            {
+                encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
+                includePreamble = true;
+            }
+            else
+            {
+                encoding = Encoding.GetEncoding(requestedEncoding);
+            }
+        }
+        else
+        {
+            (encoding, includePreamble) = await DetectExistingEncodingAsync(fullPath, cancellationToken);
+        }
+
+        var body = encoding.GetBytes(content);
+        if (!includePreamble)
+        {
+            return body;
+        }
+
+        var preamble = encoding.GetPreamble();
+        if (preamble.Length == 0)
+        {
+            return body;
+        }
+
+        var result = new byte[preamble.Length + body.Length];
+        Buffer.BlockCopy(preamble, 0, result, 0, preamble.Length);
+        Buffer.BlockCopy(body, 0, result, preamble.Length, body.Length);
+        return result;
+    }
+
+    private static async Task<(Encoding Encoding, bool IncludePreamble)> DetectExistingEncodingAsync(
+        string fullPath,
+        CancellationToken cancellationToken)
+    {
+        if (!File.Exists(fullPath))
+        {
+            return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), false);
+        }
+
+        var prefix = new byte[4];
+        await using var stream = new FileStream(
+            fullPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 4,
+            useAsync: true);
+        var read = await stream.ReadAsync(prefix.AsMemory(0, prefix.Length), cancellationToken);
+
+        if (read >= 4 && prefix[0] == 0x00 && prefix[1] == 0x00 && prefix[2] == 0xFE && prefix[3] == 0xFF)
+        {
+            return (new UTF32Encoding(bigEndian: true, byteOrderMark: true), true);
+        }
+
+        if (read >= 4 && prefix[0] == 0xFF && prefix[1] == 0xFE && prefix[2] == 0x00 && prefix[3] == 0x00)
+        {
+            return (new UTF32Encoding(bigEndian: false, byteOrderMark: true), true);
+        }
+
+        if (read >= 3 && prefix[0] == 0xEF && prefix[1] == 0xBB && prefix[2] == 0xBF)
+        {
+            return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: true), true);
+        }
+
+        if (read >= 2 && prefix[0] == 0xFF && prefix[1] == 0xFE)
+        {
+            return (new UnicodeEncoding(bigEndian: false, byteOrderMark: true), true);
+        }
+
+        if (read >= 2 && prefix[0] == 0xFE && prefix[1] == 0xFF)
+        {
+            return (new UnicodeEncoding(bigEndian: true, byteOrderMark: true), true);
+        }
+
+        return (new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), false);
+    }
     private static Encoding ResolveEncoding(string? encoding)
     {
         return string.IsNullOrWhiteSpace(encoding) ? Encoding.UTF8 : Encoding.GetEncoding(encoding);

@@ -1,19 +1,41 @@
 using System.Diagnostics;
+using System.IO;
+using System.Text.Json;
+using System.Threading.Channels;
 
 namespace WindowsCommander.McpServer.Mcp;
 
-internal sealed class RescueConsole
+internal sealed class RescueConsole : IAsyncDisposable
 {
+    private const long RotateBytes = 8L * 1024L * 1024L;
+
     private readonly object gate = new();
+    private readonly bool consoleEnabled;
     private readonly bool colorEnabled;
+    private readonly Channel<ActivityEvent> events;
+    private readonly CancellationTokenSource lifetime = new();
+    private readonly Task writerTask;
     private int active;
     private int queued;
 
     public RescueConsole()
     {
-        colorEnabled = !Console.IsErrorRedirected && !string.Equals(
+        consoleEnabled = !Console.IsErrorRedirected || string.Equals(
+            Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_ACTIVITY_CONSOLE"), "1", StringComparison.OrdinalIgnoreCase);
+        colorEnabled = consoleEnabled && !Console.IsErrorRedirected && !string.Equals(
             Environment.GetEnvironmentVariable("NO_COLOR"), "1", StringComparison.OrdinalIgnoreCase);
+
+        EventLogPath = ResolveEventLogPath();
+        events = Channel.CreateBounded<ActivityEvent>(new BoundedChannelOptions(2048)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+        writerTask = Task.Run(WriteEventsAsync);
     }
+
+    public string EventLogPath { get; }
 
     public ActivityScope Queued(string lane, string operation, string? target = null)
     {
@@ -31,12 +53,25 @@ internal sealed class RescueConsole
     private void Write(string color, string state, string lane, string operation, string? target, long elapsedMs)
     {
         var prefix = colorEnabled ? Ansi(color) : string.Empty;
-        var reset = colorEnabled ? "\u001b[0m" : string.Empty;
+        var reset = colorEnabled ? "[0m" : string.Empty;
         var detail = string.IsNullOrWhiteSpace(target) ? string.Empty : $" | {target}";
-        lock (gate)
+        if (consoleEnabled)
         {
-            Console.Error.WriteLine($"{prefix}[WC] {state,-16} {lane,-8} {elapsedMs,7} ms | {operation}{detail}{reset}");
+            lock (gate)
+            {
+                Console.Error.WriteLine($"{prefix}[WC] {state,-16} {lane,-8} {elapsedMs,7} ms | {operation}{detail}{reset}");
+            }
         }
+
+        _ = events.Writer.TryWrite(new ActivityEvent(
+            DateTimeOffset.UtcNow,
+            state,
+            lane,
+            operation,
+            target,
+            elapsedMs,
+            Volatile.Read(ref active),
+            Volatile.Read(ref queued)));
     }
 
     private void Begin(string lane, string operation, string? target, Stopwatch stopwatch)
@@ -49,21 +84,122 @@ internal sealed class RescueConsole
     private void End(string lane, string operation, string? target, Stopwatch stopwatch, Exception? error)
     {
         Interlocked.Decrement(ref active);
-        Write(error is null ? "GREEN" : "RED", error is null ? "SUCCESS" : "FAILED", lane, operation,
-            error is null ? target : error.Message, stopwatch.ElapsedMilliseconds);
+        Write(
+            error is null ? "GREEN" : "RED",
+            error is null ? "SUCCESS" : "FAILED",
+            lane,
+            operation,
+            error is null ? target : error.Message,
+            stopwatch.ElapsedMilliseconds);
+    }
+
+    private async Task WriteEventsAsync()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(EventLogPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            RotateIfNeeded();
+
+            await using var stream = new FileStream(
+                EventLogPath,
+                FileMode.Append,
+                FileAccess.Write,
+                FileShare.ReadWrite | FileShare.Delete,
+                bufferSize: 32 * 1024,
+                options: FileOptions.Asynchronous);
+            await using var writer = new StreamWriter(stream)
+            {
+                AutoFlush = true
+            };
+
+            await foreach (var activityEvent in events.Reader.ReadAllAsync(lifetime.Token))
+            {
+                await writer.WriteLineAsync(JsonSerializer.Serialize(activityEvent));
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"[WC] activity observer stream disabled: {exception.Message}");
+        }
+    }
+
+    private void RotateIfNeeded()
+    {
+        try
+        {
+            if (!File.Exists(EventLogPath) || new FileInfo(EventLogPath).Length <= RotateBytes)
+            {
+                return;
+            }
+
+            var previous = EventLogPath + ".1";
+            File.Move(EventLogPath, previous, overwrite: true);
+        }
+        catch
+        {
+            // Activity rendering is observational and never blocks the MCP.
+        }
+    }
+
+    private static string ResolveEventLogPath()
+    {
+        var configured = Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_ACTIVITY_LOG");
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            return Path.GetFullPath(Environment.ExpandEnvironmentVariables(configured));
+        }
+
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "WindowsCommander",
+            "activity.jsonl");
     }
 
     private static string Ansi(string color) => color switch
     {
-        "GREEN" => "\u001b[32m",
-        "CYAN" => "\u001b[36m",
-        "BLUE" => "\u001b[34m",
-        "YELLOW" => "\u001b[33m",
-        "MAGENTA" => "\u001b[35m",
-        "RED" => "\u001b[31m",
-        "GRAY" => "\u001b[90m",
+        "GREEN" => "[32m",
+        "CYAN" => "[36m",
+        "BLUE" => "[34m",
+        "YELLOW" => "[33m",
+        "MAGENTA" => "[35m",
+        "RED" => "[31m",
+        "GRAY" => "[90m",
         _ => string.Empty
     };
+
+    public async ValueTask DisposeAsync()
+    {
+        events.Writer.TryComplete();
+        try
+        {
+            await writerTask.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        catch
+        {
+            lifetime.Cancel();
+            try { await writerTask; } catch { }
+        }
+
+        lifetime.Dispose();
+    }
+
+    private sealed record ActivityEvent(
+        DateTimeOffset Timestamp,
+        string State,
+        string Lane,
+        string Operation,
+        string? Detail,
+        long ElapsedMs,
+        int Active,
+        int Queued);
 
     internal sealed class ActivityScope : IDisposable
     {
@@ -101,7 +237,13 @@ internal sealed class RescueConsole
             if (!started)
             {
                 Interlocked.Decrement(ref owner.queued);
-                owner.Write(error is null ? "GRAY" : "RED", error is null ? "CANCELLED" : "FAILED", lane, operation, error?.Message ?? target, stopwatch.ElapsedMilliseconds);
+                owner.Write(
+                    error is null ? "GRAY" : "RED",
+                    error is null ? "CANCELLED" : "FAILED",
+                    lane,
+                    operation,
+                    error?.Message ?? target,
+                    stopwatch.ElapsedMilliseconds);
                 return;
             }
 

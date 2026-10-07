@@ -13,8 +13,53 @@ function Get-ObjectProperty($Object,[string]$Name,$Default=$null) {
   return $prop.Value
 }
 
+function Clamp-Int([int]$Value,[int]$Minimum,[int]$Maximum) {
+  if($Value -lt $Minimum){return $Minimum}
+  if($Value -gt $Maximum){return $Maximum}
+  return $Value
+}
+
+if(-not (Test-Path -LiteralPath $RuntimeConfigPath)){
+  throw "Windows Commander runtime config was not found: $RuntimeConfigPath"
+}
+
 $cfg=Get-Content -LiteralPath $RuntimeConfigPath -Raw | ConvertFrom-Json
+foreach($required in @('alias','tunnelId','runtimeApiKeyRef','tunnelClientPath','executable')){
+  $value=[string](Get-ObjectProperty $cfg $required '')
+  if([string]::IsNullOrWhiteSpace($value)){
+    throw "Windows Commander runtime config is missing '$required'."
+  }
+}
+
+if(-not (Test-Path -LiteralPath ([string]$cfg.tunnelClientPath))){
+  throw "tunnel-client was not found: $($cfg.tunnelClientPath)"
+}
+if(-not (Test-Path -LiteralPath ([string]$cfg.executable))){
+  throw "Windows Commander executable was not found: $($cfg.executable)"
+}
+
 $mcpCommand=([string]$cfg.executable) -replace '\\','/'
+$instanceKey=[string](Get-ObjectProperty $cfg 'instanceKey' $cfg.alias)
+$unattended=[bool](Get-ObjectProperty $cfg 'unattended' $true)
+$maxConcurrency=Clamp-Int ([int](Get-ObjectProperty $cfg 'maxConcurrency' 6)) 1 10
+$requestTimeoutMs=Clamp-Int ([int](Get-ObjectProperty $cfg 'requestTimeoutMs' 90000)) 5000 110000
+$activityLogPath=[string](Get-ObjectProperty $cfg 'activityLogPath' '')
+$serenaRoot=[string](Get-ObjectProperty $cfg 'serenaRoot' '')
+$serenaStartScript=[string](Get-ObjectProperty $cfg 'serenaStartScript' '')
+
+$env:WINDOWS_COMMANDER_INSTANCE_KEY=$instanceKey
+$env:WINDOWS_COMMANDER_UNATTENDED=if($unattended){'1'}else{'0'}
+$env:WINDOWS_COMMANDER_MAX_CONCURRENCY=[string]$maxConcurrency
+$env:WINDOWS_COMMANDER_REQUEST_TIMEOUT_MS=[string]$requestTimeoutMs
+if(-not [string]::IsNullOrWhiteSpace($activityLogPath)){
+  $env:WINDOWS_COMMANDER_ACTIVITY_LOG=[Environment]::ExpandEnvironmentVariables($activityLogPath)
+}
+if(-not [string]::IsNullOrWhiteSpace($serenaRoot)){
+  $env:WINDOWS_COMMANDER_SERENA_ROOT=[Environment]::ExpandEnvironmentVariables($serenaRoot)
+}
+if(-not [string]::IsNullOrWhiteSpace($serenaStartScript)){
+  $env:WINDOWS_COMMANDER_SERENA_START_SCRIPT=[Environment]::ExpandEnvironmentVariables($serenaStartScript)
+}
 
 function Invoke-TunnelClient([string[]]$Arguments){
   $saved=$ErrorActionPreference
@@ -34,10 +79,17 @@ function Status {
 
 function Test-ManagedReady($Status) {
   if($null -eq $Status){return $false}
-  return (Get-ObjectProperty $Status 'process_running' $false) -eq $true -and
-    (Get-ObjectProperty $Status 'healthy' $false) -eq $true -and
-    (Get-ObjectProperty $Status 'ready' $false) -eq $true -and
-    (Get-ObjectProperty $Status 'tunnel_id' '') -eq $cfg.tunnelId
+  if((Get-ObjectProperty $Status 'process_running' $false) -ne $true){return $false}
+  if((Get-ObjectProperty $Status 'healthy' $false) -ne $true){return $false}
+  if((Get-ObjectProperty $Status 'ready' $false) -ne $true){return $false}
+  if((Get-ObjectProperty $Status 'tunnel_id' '') -ne $cfg.tunnelId){return $false}
+
+  $process=Get-ObjectProperty $Status 'process' $null
+  $target=[string](Get-ObjectProperty $process 'target_value' '')
+  if([string]::IsNullOrWhiteSpace($target)){return $false}
+
+  $actual=($target -replace '\\','/').Trim('"',"'")
+  return $actual.Equals($mcpCommand,[StringComparison]::OrdinalIgnoreCase)
 }
 
 function Stop-UnmanagedRawProfileOwners {
@@ -63,9 +115,6 @@ function Stop-UnmanagedRawProfileOwners {
   }
 }
 
-# Enforce one ownership model per alias before accepting a healthy managed
-# runtime. A manually launched "tunnel-client run --profile <alias>" process
-# can coexist with a healthy managed runtime and recreate split-brain ownership.
 Stop-UnmanagedRawProfileOwners
 
 $s=Status
@@ -74,33 +123,46 @@ if(Test-ManagedReady $s){
 }
 
 if($s){
-  $stop=Invoke-TunnelClient @('runtimes','stop',$cfg.alias,'--json')
+  [void](Invoke-TunnelClient @('runtimes','stop',$cfg.alias,'--json'))
   for($i=0;$i -lt 20;$i++){
     Start-Sleep -Milliseconds 500
     $s=Status
     if(-not $s -or (Get-ObjectProperty $s 'process_running' $false) -ne $true){break}
   }
+
   $rm=Invoke-TunnelClient @('runtimes','rm',$cfg.alias,'--json')
   if($rm.ExitCode -ne 0 -and $rm.Output -notmatch '(?i)(not known|does not exist|not found)'){
     throw "Unable to remove unhealthy Windows Commander runtime: $($rm.Output.Trim())"
   }
 }
 
-$connect=Invoke-TunnelClient @(
-  'runtimes','connect',
-  '--alias',$cfg.alias,
-  '--tunnel-id',$cfg.tunnelId,
-  '--runtime-api-key',$cfg.runtimeApiKeyRef,
-  '--mcp-command',$mcpCommand,
-  '--json'
-)
-if($connect.ExitCode -ne 0){throw "Unable to start Windows Commander runtime: $($connect.Output.Trim())"}
+$lastError=''
+for($attempt=1;$attempt -le 3;$attempt++){
+  $connect=Invoke-TunnelClient @(
+    'runtimes','connect',
+    '--alias',$cfg.alias,
+    '--tunnel-id',$cfg.tunnelId,
+    '--runtime-api-key',$cfg.runtimeApiKeyRef,
+    '--mcp-command',$mcpCommand,
+    '--json'
+  )
 
-for($i=0;$i -lt 45;$i++){
-  Start-Sleep -Seconds 1
-  $s=Status
-  if(Test-ManagedReady $s){
-    return
+  if($connect.ExitCode -eq 0){
+    for($i=0;$i -lt 45;$i++){
+      Start-Sleep -Seconds 1
+      $s=Status
+      if(Test-ManagedReady $s){
+        return
+      }
+    }
+    $lastError='managed runtime did not become ready with the configured executable'
+  }else{
+    $lastError=$connect.Output.Trim()
+  }
+
+  if($attempt -lt 3){
+    Start-Sleep -Seconds ([int][Math]::Pow(2,$attempt-1))
   }
 }
-throw 'Windows Commander managed runtime failed startup readiness.'
+
+throw "Windows Commander managed runtime failed startup: $lastError"

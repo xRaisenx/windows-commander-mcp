@@ -1,13 +1,16 @@
+using System.IO;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using WindowsCommander.McpServer;
+using WindowsCommander.McpServer.CodeIntel;
 using WindowsCommander.McpServer.Mcp;
 using WindowsCommander.Safety.Audit;
 using WindowsCommander.Safety.Policy;
 using WindowsCommander.Windows.Services;
 
+_ = HostEnvironmentSanitizer.ScrubCurrentProcess();
 using var instanceGuard = InstanceGuard.Acquire();
 
 var requireConfirmation = !IsUnattended();
@@ -29,6 +32,8 @@ var maxRequestBytes = GetBoundedEnvironmentInt(
 
 var rescueConsole = new RescueConsole();
 var processOperations = new ProcessOperationSupervisor(Math.Min(2, maxConcurrency));
+var codeIntel = new CodeIntelManager();
+var serenaRescue = new SerenaRescueService(processOperations);
 var serverUptime = Stopwatch.StartNew();
 Func<object> runtimeStatusProvider = () => CreateRuntimeStatus(
     rescueConsole,
@@ -59,7 +64,9 @@ var dispatcher = new ToolDispatcher(
     new RiskPolicyService(),
     requireConfirmation,
     runtimeStatusProvider,
-    processOperations);
+    processOperations,
+    codeIntel,
+    serenaRescue);
 using var globalConcurrency = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 using var desktopLane = new SemaphoreSlim(1, 1);
 using var processLane = new SemaphoreSlim(Math.Min(2, maxConcurrency), Math.Min(2, maxConcurrency));
@@ -106,34 +113,22 @@ while (await input.ReadLineAsync() is { } line)
 
     await globalConcurrency.WaitAsync();
     inFlight.RemoveAll(static task => task.IsCompleted);
-
-    inFlight.Add(Task.Run(async () =>
-    {
-        try
-        {
-            var response = await HandleLineAsync(
-                line,
-                dispatcher,
-                desktopLane,
-                processLane,
-                requestTimeoutMs,
-                rescueConsole);
-
-            if (response is not null)
-            {
-                await responses.Writer.WriteAsync(response);
-            }
-        }
-        finally
-        {
-            globalConcurrency.Release();
-        }
-    }));
+    inFlight.Add(ProcessLineAndQueueResponseAsync(
+        line,
+        dispatcher,
+        desktopLane,
+        processLane,
+        requestTimeoutMs,
+        rescueConsole,
+        responses.Writer,
+        globalConcurrency));
 }
 
 await Task.WhenAll(inFlight);
 responses.Writer.TryComplete();
 await writerTask;
+await codeIntel.DisposeAsync();
+await rescueConsole.DisposeAsync();
 
 static JsonRpcResponse? TryCreateRuntimeStatusResponse(string line, Func<object> runtimeStatusProvider)
 {
@@ -204,11 +199,42 @@ static object CreateRuntimeStatus(
         request_timeout_ms = requestTimeoutMs,
         max_request_bytes = maxRequestBytes,
         stdout_protocol_only = true,
+        activity_log = rescueConsole.EventLogPath,
         inherited_child_secrets_allowed = ChildEnvironmentSanitizer.AllowsInheritedSecrets,
         scheduler = rescueConsole.Snapshot()
     };
 }
 
+static async Task ProcessLineAndQueueResponseAsync(
+    string line,
+    ToolDispatcher dispatcher,
+    SemaphoreSlim desktopLane,
+    SemaphoreSlim processLane,
+    int requestTimeoutMs,
+    RescueConsole rescueConsole,
+    ChannelWriter<JsonRpcResponse> writer,
+    SemaphoreSlim globalConcurrency)
+{
+    try
+    {
+        var response = await HandleLineAsync(
+            line,
+            dispatcher,
+            desktopLane,
+            processLane,
+            requestTimeoutMs,
+            rescueConsole);
+
+        if (response is not null)
+        {
+            await writer.WriteAsync(response);
+        }
+    }
+    finally
+    {
+        globalConcurrency.Release();
+    }
+}
 static async Task WriteResponsesAsync(ChannelReader<JsonRpcResponse> reader, StreamWriter output)
 {
     await foreach (var response in reader.ReadAllAsync())

@@ -4,11 +4,13 @@ using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Safety;
 using WindowsCommander.Core.Services;
 using WindowsCommander.McpServer;
+using WindowsCommander.McpServer.CodeIntel;
 
 namespace WindowsCommander.McpServer.Mcp;
 
 public sealed class ToolDispatcher
 {
+    private object? toolListCache;
     private readonly IProcessService processService;
     private readonly IWindowService windowService;
     private readonly IScreenService screenService;
@@ -29,6 +31,8 @@ public sealed class ToolDispatcher
     private readonly IRiskPolicyService riskPolicy;
     private readonly Func<object>? runtimeStatusProvider;
     private readonly ProcessOperationSupervisor? processOperations;
+    private readonly CodeIntelManager? codeIntel;
+    private readonly SerenaRescueService? serenaRescue;
     // When true, high-risk tools are gated behind a local confirmation dialog.
     // Disabled (unattended mode) for automated harness/CI runs.
     private readonly bool requireConfirmation;
@@ -78,7 +82,9 @@ public sealed class ToolDispatcher
         IRiskPolicyService riskPolicy,
         bool requireConfirmation,
         Func<object>? runtimeStatusProvider = null,
-        ProcessOperationSupervisor? processOperations = null)
+        ProcessOperationSupervisor? processOperations = null,
+        CodeIntelManager? codeIntel = null,
+        SerenaRescueService? serenaRescue = null)
     {
         this.processService = processService;
         this.windowService = windowService;
@@ -101,11 +107,13 @@ public sealed class ToolDispatcher
         this.requireConfirmation = requireConfirmation;
         this.runtimeStatusProvider = runtimeStatusProvider;
         this.processOperations = processOperations;
+        this.codeIntel = codeIntel;
+        this.serenaRescue = serenaRescue;
     }
 
     public object ListTools()
     {
-        return new
+        return toolListCache ??= new
         {
             tools = new[]
             {
@@ -342,7 +350,49 @@ public sealed class ToolDispatcher
                 Tool("get_process_operation", "Gets current state and bounded output for a long-running process operation.",
                     Str("operation_id", "Operation id returned by start_process_operation.", required: true)),
                 Tool("cancel_process_operation", "Cancels an owned long-running process operation and its process tree.",
-                    Str("operation_id", "Operation id returned by start_process_operation.", required: true))
+                    Str("operation_id", "Operation id returned by start_process_operation.", required: true)),
+                Tool("codeintel_start", "Starts an isolated language-server session for semantic rescue operations.",
+                    Str("executable_path", "Language server executable path.", required: true),
+                    StrArray("arguments", "Language server arguments."),
+                    Str("workspace_root", "Workspace root for the language server.", required: true),
+                    Str("language_id", "LSP language id such as csharp, typescript, javascript, or python.", required: true)),
+                Tool("codeintel_status", "Returns status for an isolated semantic rescue session.",
+                    Str("session_id", "CodeIntel session id.", required: true)),
+                Tool("codeintel_symbols", "Returns semantic document symbols for a source file.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true)),
+                Tool("codeintel_definition", "Resolves a semantic definition from an LSP position.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true),
+                    Int("line", "Zero-based line.", required: true),
+                    Int("character", "Zero-based UTF-16 character offset.", required: true)),
+                Tool("codeintel_references", "Returns semantic references for an LSP position.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true),
+                    Int("line", "Zero-based line.", required: true),
+                    Int("character", "Zero-based UTF-16 character offset.", required: true),
+                    Bool("include_declaration", "Include the declaration in references.")),
+                Tool("codeintel_diagnostics", "Returns current language-server diagnostics for a source file.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true)),
+                Tool("codeintel_safe_delete_preflight", "Checks semantic references before a caller deletes a symbol.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true),
+                    Int("line", "Zero-based line on the symbol.", required: true),
+                    Int("character", "Zero-based UTF-16 character offset on the symbol.", required: true)),
+                Tool("codeintel_replace_symbol", "Replaces one semantic symbol body with stale-read protection and rollback if diagnostics worsen.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true),
+                    Str("symbol_name", "Exact semantic symbol name.", required: true),
+                    Str("replacement", "Replacement text for the resolved symbol range.", required: true)),
+                Tool("codeintel_stop", "Stops an isolated semantic rescue session.",
+                    Str("session_id", "CodeIntel session id.", required: true)),
+                Tool("serena_rescue_status", "Checks configured Serena root, startup script, router listener, and master listener without requiring Serena itself."),
+                Tool("serena_rescue_restart", "Starts the configured Serena recovery script as a durable process operation.",
+                    Int("timeout_ms", "Maximum recovery operation time in milliseconds.")),
+                Tool("serena_rescue_logs", "Returns bounded tails from the newest Serena log files.",
+                    Int("max_files", "Maximum log files to return."),
+                    Int("lines_per_file", "Maximum lines to return per file."))
             }
         };
     }
@@ -641,10 +691,166 @@ public sealed class ToolDispatcher
                 GetRequiredString(arguments, "operation_id")),
             "cancel_process_operation" => (processOperations ?? throw new InvalidOperationException("Process operation supervisor is unavailable.")).Cancel(
                 GetRequiredString(arguments, "operation_id")),
-            _ => throw new ArgumentException($"Unknown tool: {name}")
+            "codeintel_start" or "codeintel_status" or "codeintel_symbols" or "codeintel_definition"
+                or "codeintel_references" or "codeintel_diagnostics" or "codeintel_safe_delete_preflight"
+                or "codeintel_replace_symbol" or "codeintel_stop"
+                => await DispatchCodeIntelToolAsync(name, arguments, cancellationToken),
+            "serena_rescue_status" or "serena_rescue_restart" or "serena_rescue_logs"
+                => await DispatchSerenaRescueToolAsync(name, arguments, cancellationToken),            _ => throw new ArgumentException($"Unknown tool: {name}")
         };
     }
 
+    private async Task<object> DispatchCodeIntelToolAsync(
+        string name,
+        JsonElement? arguments,
+        CancellationToken cancellationToken)
+    {
+        var manager = codeIntel ?? throw new InvalidOperationException("CodeIntel rescue manager is unavailable.");
+
+        return name switch
+        {
+            "codeintel_start" => await manager.StartAsync(
+                GetRequiredString(arguments, "executable_path"),
+                GetStringArray(arguments, "arguments") ?? Array.Empty<string>(),
+                GetRequiredString(arguments, "workspace_root"),
+                GetRequiredString(arguments, "language_id"),
+                cancellationToken),
+            "codeintel_status" => manager.Status(GetRequiredString(arguments, "session_id")),
+            "codeintel_symbols" => await manager.SymbolsAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                cancellationToken),
+            "codeintel_definition" => await manager.DefinitionAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                GetRequiredInt(arguments, "line"),
+                GetRequiredInt(arguments, "character"),
+                cancellationToken),
+            "codeintel_references" => await manager.ReferencesAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                GetRequiredInt(arguments, "line"),
+                GetRequiredInt(arguments, "character"),
+                GetBool(arguments, "include_declaration") ?? false,
+                cancellationToken),
+            "codeintel_diagnostics" => await manager.DiagnosticsAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                cancellationToken),
+            "codeintel_safe_delete_preflight" => await manager.SafeDeletePreflightAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                GetRequiredInt(arguments, "line"),
+                GetRequiredInt(arguments, "character"),
+                cancellationToken),
+            "codeintel_replace_symbol" => await ReplaceCodeIntelSymbolAsync(manager, arguments, cancellationToken),
+            "codeintel_stop" => await manager.StopAsync(GetRequiredString(arguments, "session_id")),
+            _ => throw new ArgumentException($"Unknown CodeIntel tool: {name}")
+        };
+    }
+
+    private async Task<object> ReplaceCodeIntelSymbolAsync(
+        CodeIntelManager manager,
+        JsonElement? arguments,
+        CancellationToken cancellationToken)
+    {
+        var sessionId = GetRequiredString(arguments, "session_id");
+        var path = GetRequiredString(arguments, "path");
+        var symbolName = GetRequiredString(arguments, "symbol_name");
+        var replacement = GetRequiredString(arguments, "replacement");
+
+        var beforeErrors = await manager.ErrorCountAsync(sessionId, path, cancellationToken);
+        var proposal = await manager.CreateReplacementProposalAsync(
+            sessionId,
+            path,
+            symbolName,
+            replacement,
+            cancellationToken);
+
+        var write = await fileSystemService.WriteFileAsync(
+            proposal.Path,
+            proposal.NewText,
+            encoding: null,
+            overwrite: true,
+            createDirectories: false,
+            expectedSha256: proposal.ExpectedSha256,
+            cancellationToken);
+
+        var current = await fileSystemService.GetFilePropertiesAsync(
+            proposal.Path,
+            "SHA256",
+            cancellationToken);
+        var appliedSha = current.Hash
+            ?? throw new InvalidOperationException("Unable to establish post-write SHA-256.");
+
+        await manager.RefreshDocumentAsync(sessionId, proposal.Path, cancellationToken);
+        var afterErrors = await manager.ErrorCountAsync(sessionId, proposal.Path, cancellationToken);
+
+        if (afterErrors > beforeErrors)
+        {
+            await fileSystemService.WriteFileAsync(
+                proposal.Path,
+                proposal.OriginalText,
+                encoding: null,
+                overwrite: true,
+                createDirectories: false,
+                expectedSha256: appliedSha,
+                cancellationToken);
+
+            await manager.RefreshDocumentAsync(sessionId, proposal.Path, cancellationToken);
+
+            return new
+            {
+                applied = false,
+                rolled_back = true,
+                reason = "Language-server error count increased after the replacement.",
+                before_errors = beforeErrors,
+                after_errors = afterErrors,
+                symbol = proposal.SymbolName,
+                path = proposal.Path,
+                range = new
+                {
+                    start = new { line = proposal.StartLine, character = proposal.StartCharacter },
+                    end = new { line = proposal.EndLine, character = proposal.EndCharacter }
+                }
+            };
+        }
+
+        return new
+        {
+            applied = true,
+            rolled_back = false,
+            before_errors = beforeErrors,
+            after_errors = afterErrors,
+            symbol = proposal.SymbolName,
+            path = proposal.Path,
+            bytes_written = write.BytesWritten,
+            sha256 = appliedSha,
+            range = new
+            {
+                start = new { line = proposal.StartLine, character = proposal.StartCharacter },
+                end = new { line = proposal.EndLine, character = proposal.EndCharacter }
+            }
+        };
+    }
+
+    private async Task<object> DispatchSerenaRescueToolAsync(
+        string name,
+        JsonElement? arguments,
+        CancellationToken cancellationToken)
+    {
+        var rescue = serenaRescue ?? throw new InvalidOperationException("Serena rescue service is unavailable.");
+
+        return name switch
+        {
+            "serena_rescue_status" => await rescue.GetStatusAsync(cancellationToken),
+            "serena_rescue_restart" => rescue.Restart(GetInt(arguments, "timeout_ms")),
+            "serena_rescue_logs" => rescue.GetRecentLogs(
+                GetInt(arguments, "max_files"),
+                GetInt(arguments, "lines_per_file")),
+            _ => throw new ArgumentException($"Unknown Serena rescue tool: {name}")
+        };
+    }
     private object DispatchProcessTool(string name, JsonElement? arguments, CancellationToken cancellationToken)
     {
         return name switch
