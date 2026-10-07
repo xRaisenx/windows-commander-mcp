@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-  [string]$RuntimeConfigPath = (Join-Path $PSScriptRoot 'runtime.json')
+  [string]$RuntimeConfigPath = (Join-Path $PSScriptRoot 'runtime.json'),
+  [switch]$TakeManagedOwnership
 )
 
 $ErrorActionPreference='Stop'
