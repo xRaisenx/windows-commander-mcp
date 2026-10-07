@@ -1,35 +1,29 @@
-using System;
+using System.Diagnostics;
 using System.Reflection;
+using System.Security.Cryptography;
 
 namespace WindowsCommander.McpServer;
 
-/// <summary>
-/// Identity the server reports in its MCP <c>initialize</c> response. The
-/// version is resolved from the running assembly, so a release build (which
-/// stamps the version via <c>dotnet publish -p:Version=</c>) reports the real
-/// tag version rather than a hardcoded constant.
-/// </summary>
+/// <summary>Identity and provenance reported by the running rescue server.</summary>
 public static class ServerInfo
 {
     public const string Name = "windows-commander-mcp";
 
-    /// <summary>Version reported to MCP clients, resolved once at startup.</summary>
-    public static string Version { get; } = ResolveVersion();
+    private static readonly Assembly ExecutingAssembly = Assembly.GetExecutingAssembly();
 
-    static string ResolveVersion()
-    {
-        var assembly = Assembly.GetExecutingAssembly();
-        var informational = assembly
-            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
-            .InformationalVersion;
-        return CleanVersion(informational, assembly.GetName().Version);
-    }
+    public static string InformationalVersion { get; } =
+        ExecutingAssembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? ExecutingAssembly.GetName().Version?.ToString()
+        ?? "0.0.0";
 
-    /// <summary>
-    /// Normalises a raw version string. Prefers the SemVer-style informational
-    /// version, dropping any <c>+build</c> metadata the SDK appends; falls back
-    /// to the three-part assembly version when no informational version is set.
-    /// </summary>
+    public static string Version { get; } = CleanVersion(InformationalVersion, ExecutingAssembly.GetName().Version);
+
+    public static string? SourceRevision { get; } = ResolveSourceRevision();
+
+    public static string? ExecutableSha256 { get; } = ResolveExecutableSha256();
+
+    public static DateTimeOffset ProcessStartedAt { get; } = ResolveProcessStart();
+
     public static string CleanVersion(string? informationalVersion, Version? assemblyVersion)
     {
         if (!string.IsNullOrWhiteSpace(informationalVersion))
@@ -39,5 +33,61 @@ public static class ServerInfo
         }
 
         return assemblyVersion?.ToString(3) ?? "0.0.0";
+    }
+
+    private static string? ResolveSourceRevision()
+    {
+        var explicitRevision = ExecutingAssembly
+            .GetCustomAttributes<AssemblyMetadataAttribute>()
+            .FirstOrDefault(attribute =>
+                attribute.Key.Equals("RepositoryCommit", StringComparison.OrdinalIgnoreCase)
+                || attribute.Key.Equals("SourceRevisionId", StringComparison.OrdinalIgnoreCase))
+            ?.Value;
+
+        if (!string.IsNullOrWhiteSpace(explicitRevision))
+        {
+            return explicitRevision;
+        }
+
+        var plus = InformationalVersion.IndexOf('+');
+        return plus >= 0 && plus + 1 < InformationalVersion.Length
+            ? InformationalVersion[(plus + 1)..]
+            : null;
+    }
+
+    private static string? ResolveExecutableSha256()
+    {
+        var path = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var stream = File.OpenRead(path);
+            return Convert.ToHexString(SHA256.HashData(stream));
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static DateTimeOffset ResolveProcessStart()
+    {
+        try
+        {
+            using var process = Process.GetCurrentProcess();
+            return process.StartTime.ToUniversalTime();
+        }
+        catch
+        {
+            return DateTimeOffset.UtcNow;
+        }
     }
 }
