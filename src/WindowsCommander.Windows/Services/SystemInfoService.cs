@@ -14,7 +14,7 @@ public sealed class SystemInfoService : ISystemInfoService
             Environment.OSVersion.VersionString,
             Environment.MachineName,
             Environment.UserName,
-            "Unknown",
+            null,
             RuntimeInformation.ProcessArchitecture.ToString(),
             TimeSpan.FromMilliseconds(Environment.TickCount64),
             SystemInformation.PowerStatus.BatteryChargeStatus.ToString(),

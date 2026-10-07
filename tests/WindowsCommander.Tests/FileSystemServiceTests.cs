@@ -13,7 +13,7 @@ public class FileSystemServiceTests
 
         try
         {
-            var writeResult = await service.WriteFileAsync(filePath, "hello", "utf-8", overwrite: false, createDirectories: true, CancellationToken.None);
+            var writeResult = await service.WriteFileAsync(filePath, "hello", "utf-8", overwrite: false, createDirectories: true, expectedSha256: null, CancellationToken.None);
             var readResult = await service.ReadFileAsync(filePath, "utf-8", maxBytes: null, asBase64: false, CancellationToken.None);
             var properties = await service.GetFilePropertiesAsync(filePath, "SHA256", CancellationToken.None);
 
@@ -98,4 +98,120 @@ public class FileSystemServiceTests
             Directory.Delete(tempDirectory, recursive: true);
         }
     }
-}
+
+    [Fact]
+    public async Task ReadFileAsync_ReportsTruncationWithoutReadingWholeFile()
+    {
+        var service = new FileSystemService();
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "windows-commander-tests", Guid.NewGuid().ToString("N"));
+        var filePath = Path.Combine(tempDirectory, "large.txt");
+        Directory.CreateDirectory(tempDirectory);
+        await File.WriteAllTextAsync(filePath, new string('x', 200_000));
+
+        try
+        {
+            var result = await service.ReadFileAsync(filePath, "utf-8", maxBytes: 1024, asBase64: false, CancellationToken.None);
+            Assert.True(result.Truncated);
+            Assert.Equal(200_000, result.TotalBytes);
+            Assert.InRange(result.BytesRead, 1, 1024);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task WriteFileAsync_GuardedOverwriteRejectsStaleHash()
+    {
+        var service = new FileSystemService();
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "windows-commander-tests", Guid.NewGuid().ToString("N"));
+        var filePath = Path.Combine(tempDirectory, "guarded.txt");
+        Directory.CreateDirectory(tempDirectory);
+        await File.WriteAllTextAsync(filePath, "before");
+
+        try
+        {
+            var staleHash = new string('0', 64);
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => service.WriteFileAsync(
+                filePath,
+                "after",
+                "utf-8",
+                overwrite: true,
+                createDirectories: false,
+                expectedSha256: staleHash,
+                CancellationToken.None));
+
+            Assert.Contains("target changed", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("before", await File.ReadAllTextAsync(filePath));
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task WriteFileAsync_PreservesUtf8BomWhenEncodingIsNotSpecified()
+    {
+        var service = new FileSystemService();
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "windows-commander-tests", Guid.NewGuid().ToString("N"));
+        var filePath = Path.Combine(tempDirectory, "bom.txt");
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            await File.WriteAllTextAsync(filePath, "before", new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            var properties = await service.GetFilePropertiesAsync(filePath, "SHA256", CancellationToken.None);
+
+            await service.WriteFileAsync(
+                filePath,
+                "after",
+                encoding: null,
+                overwrite: true,
+                createDirectories: false,
+                expectedSha256: properties.Hash,
+                CancellationToken.None);
+
+            var bytes = await File.ReadAllBytesAsync(filePath);
+            Assert.True(bytes.Length >= 3);
+            Assert.Equal(0xEF, bytes[0]);
+            Assert.Equal(0xBB, bytes[1]);
+            Assert.Equal(0xBF, bytes[2]);
+            Assert.Equal("after", await File.ReadAllTextAsync(filePath));
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SearchFiles_ContentSearchReturnsMatchingFile()
+    {
+        var service = new FileSystemService();
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "windows-commander-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+
+        try
+        {
+            var wanted = Path.Combine(tempDirectory, "wanted.txt");
+            File.WriteAllText(wanted, "lightning-rescue-marker");
+            File.WriteAllText(Path.Combine(tempDirectory, "other.txt"), "unrelated");
+
+            var results = service.SearchFiles(
+                new[] { tempDirectory },
+                "*.txt",
+                "lightning-rescue-marker",
+                includeHidden: false,
+                maxResults: 10,
+                CancellationToken.None);
+
+            Assert.Single(results);
+            Assert.Equal(wanted, results[0].Path);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }}

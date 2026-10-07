@@ -5,8 +5,8 @@ public sealed record DisplayMetric(
     string DeviceName,
     string Resolution,
     RectBounds VirtualCoordinates,
-    int RefreshRate,
-    double DpiScalingFactor);
+    int? RefreshRate,
+    double? DpiScalingFactor);
 
 public sealed record WindowScreenInfo(
     long WindowHandle,
@@ -20,7 +20,7 @@ public sealed record NotificationResult(
     string Title,
     string Message,
     DateTimeOffset ShownAt,
-    bool Delivered);
+    bool? Delivered);
 
 public sealed record WindowsServiceInfo(
     string Name,

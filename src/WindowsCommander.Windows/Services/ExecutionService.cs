@@ -6,7 +6,7 @@ namespace WindowsCommander.Windows.Services;
 
 public sealed class ExecutionService : IExecutionService
 {
-    public Task<CommandExecutionResult> ExecutePowerShellAsync(
+    public async Task<CommandExecutionResult> ExecutePowerShellAsync(
         string command,
         string? workingDirectory,
         int? timeoutMs,
@@ -18,13 +18,15 @@ public sealed class ExecutionService : IExecutionService
             throw new ArgumentException("PowerShell command must not be empty.", nameof(command));
         }
 
-        return ExecuteAndCaptureAsync(
+        var capture = await ExecuteAndCaptureAsync(
             "pwsh.exe",
             new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command },
             workingDirectory,
             timeoutMs,
             environment,
             cancellationToken);
+
+        return capture.Result;
     }
 
     public async Task<ProcessStartResult> ExecuteProcessAsync(
@@ -42,15 +44,34 @@ public sealed class ExecutionService : IExecutionService
 
         if (!waitForExit)
         {
-            using var process = StartProcess(executablePath, arguments ?? Array.Empty<string>(), workingDirectory, null, redirectOutput: false);
+            using var process = StartProcess(
+                executablePath,
+                arguments ?? Array.Empty<string>(),
+                workingDirectory,
+                null,
+                redirectOutput: false);
+
             return new ProcessStartResult(process.Id, null, null, null, null, TimedOut: false);
         }
 
-        var result = await ExecuteAndCaptureAsync(executablePath, arguments ?? Array.Empty<string>(), workingDirectory, timeoutMs, null, cancellationToken);
-        return new ProcessStartResult(0, result.StandardOutput, result.StandardError, result.ExitCode, result.ElapsedTime, result.TimedOut);
+        var capture = await ExecuteAndCaptureAsync(
+            executablePath,
+            arguments ?? Array.Empty<string>(),
+            workingDirectory,
+            timeoutMs,
+            null,
+            cancellationToken);
+
+        return new ProcessStartResult(
+            capture.ProcessId,
+            capture.Result.StandardOutput,
+            capture.Result.StandardError,
+            capture.Result.ExitCode,
+            capture.Result.ElapsedTime,
+            capture.Result.TimedOut);
     }
 
-    private static async Task<CommandExecutionResult> ExecuteAndCaptureAsync(
+    private static async Task<CapturedExecution> ExecuteAndCaptureAsync(
         string executablePath,
         IReadOnlyList<string> arguments,
         string? workingDirectory,
@@ -64,27 +85,48 @@ public sealed class ExecutionService : IExecutionService
             : new CancellationTokenSource();
         using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
         using var process = StartProcess(executablePath, arguments, workingDirectory, environment, redirectOutput: true);
+        var processId = process.Id;
+
+        // Do not cancel the stream drains when the operation times out. Killing
+        // the owned process closes stdout/stderr, allowing us to preserve every
+        // byte the child produced before termination instead of returning empty
+        // evidence on the most important failure path.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
 
         try
         {
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(linkedSource.Token);
-            var stderrTask = process.StandardError.ReadToEndAsync(linkedSource.Token);
             await process.WaitForExitAsync(linkedSource.Token);
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
             stopwatch.Stop();
 
-            return new CommandExecutionResult(stdout, stderr, process.ExitCode, stopwatch.Elapsed, TimedOut: false);
+            return new CapturedExecution(
+                processId,
+                new CommandExecutionResult(stdout, stderr, process.ExitCode, stopwatch.Elapsed, TimedOut: false));
         }
         catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested)
         {
             TryKill(process);
+            await WaitForKilledProcessAsync(process);
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
             stopwatch.Stop();
-            return new CommandExecutionResult(string.Empty, "Process timed out.", null, stopwatch.Elapsed, TimedOut: true);
+
+            var timeoutMessage = string.IsNullOrWhiteSpace(stderr)
+                ? "Process timed out."
+                : $"{stderr.TrimEnd()}{Environment.NewLine}Process timed out.";
+
+            return new CapturedExecution(
+                processId,
+                new CommandExecutionResult(stdout, timeoutMessage, null, stopwatch.Elapsed, TimedOut: true));
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             TryKill(process);
+            await WaitForKilledProcessAsync(process);
+            _ = await stdoutTask;
+            _ = await stderrTask;
             stopwatch.Stop();
             throw;
         }
@@ -115,8 +157,13 @@ public sealed class ExecutionService : IExecutionService
             startInfo.WorkingDirectory = workingDirectory;
         }
 
+        _ = ChildEnvironmentSanitizer.ApplyTo(startInfo);
+
         if (environment is not null)
         {
+            // Explicit per-call environment values are deliberate and may
+            // re-introduce credentials after the inherited environment was
+            // scrubbed.
             foreach (var pair in environment)
             {
                 startInfo.Environment[pair.Key] = pair.Value;
@@ -124,6 +171,24 @@ public sealed class ExecutionService : IExecutionService
         }
 
         return Process.Start(startInfo) ?? throw new InvalidOperationException($"Failed to start process: {executablePath}");
+    }
+
+    private static async Task WaitForKilledProcessAsync(Process process)
+    {
+        try
+        {
+            using var settle = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await process.WaitForExitAsync(settle.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // The caller already has a timeout/cancellation outcome. Do not turn
+            // a stubborn process teardown into an unbounded secondary wait.
+        }
+        catch (InvalidOperationException)
+        {
+            // The process may have exited between the kill and this wait.
+        }
     }
 
     private static void TryKill(Process process)
@@ -140,4 +205,6 @@ public sealed class ExecutionService : IExecutionService
             Console.Error.WriteLine($"Failed to kill process: {ex.Message}");
         }
     }
+
+    private sealed record CapturedExecution(int ProcessId, CommandExecutionResult Result);
 }

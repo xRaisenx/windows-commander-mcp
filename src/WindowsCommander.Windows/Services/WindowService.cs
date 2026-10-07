@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Services;
@@ -34,33 +35,25 @@ public sealed class WindowService : IWindowService
     {
         const int swRestore = 9;
         const int swShow = 5;
-        const uint spiGetForegroundLockTimeout = 0x2000;
-        const uint spiSetForegroundLockTimeout = 0x2001;
 
-        // A minimized window cannot receive focus until it is restored.
-        if (NativeMethods.IsIconic(handle))
+        if (!IsWindow(handle))
         {
-            NativeMethods.ShowWindow(handle, swRestore);
+            return false;
         }
 
-        // SetForegroundWindow returns true even when Windows merely flashes the
-        // taskbar instead of activating, so its return value is never trusted:
-        // GetForegroundWindow is the single source of truth. Trusting the bool
-        // here previously skipped the AttachThreadInput fallback below.
+        if (NativeMethods.IsIconic(handle))
+        {
+            _ = NativeMethods.ShowWindow(handle, swRestore);
+        }
+
         NativeMethods.SetForegroundWindow(handle);
         if (NativeMethods.GetForegroundWindow() == handle)
         {
             return true;
         }
 
-        // Windows 11 reverts foreground changes initiated by a background
-        // process. Making the activation stick requires both clearing the
-        // foreground lock timeout and attaching our input queue to the
-        // outgoing foreground thread and the target thread.
-        uint originalLockTimeout = 0;
-        NativeMethods.SystemParametersInfoGet(spiGetForegroundLockTimeout, 0, ref originalLockTimeout, 0);
-        NativeMethods.SystemParametersInfoSet(spiSetForegroundLockTimeout, 0, nint.Zero, 0);
-
+        // Stay inside the process failure domain: use thread-input attachment,
+        // but never mutate process-global foreground-lock system settings.
         var currentThread = NativeMethods.GetCurrentThreadId();
         var foreground = NativeMethods.GetForegroundWindow();
         var foregroundThread = foreground == IntPtr.Zero
@@ -71,18 +64,17 @@ public sealed class WindowService : IWindowService
         var attachedForeground = foregroundThread != 0
             && foregroundThread != currentThread
             && NativeMethods.AttachThreadInput(currentThread, foregroundThread, true);
-        var attachedTarget = targetThread != currentThread
+        var attachedTarget = targetThread != 0
+            && targetThread != currentThread
             && targetThread != foregroundThread
             && NativeMethods.AttachThreadInput(currentThread, targetThread, true);
 
         try
         {
-            // A few attempts: the activation occasionally needs the window
-            // manager a moment to settle before it takes.
             for (var attempt = 0; attempt < 5; attempt++)
             {
                 NativeMethods.BringWindowToTop(handle);
-                NativeMethods.ShowWindow(handle, swShow);
+                _ = NativeMethods.ShowWindow(handle, swShow);
                 NativeMethods.SetForegroundWindow(handle);
 
                 if (NativeMethods.GetForegroundWindow() == handle)
@@ -90,7 +82,7 @@ public sealed class WindowService : IWindowService
                     return true;
                 }
 
-                System.Threading.Thread.Sleep(40);
+                Thread.Sleep(40);
             }
 
             return NativeMethods.GetForegroundWindow() == handle;
@@ -106,8 +98,6 @@ public sealed class WindowService : IWindowService
             {
                 NativeMethods.AttachThreadInput(currentThread, foregroundThread, false);
             }
-
-            NativeMethods.SystemParametersInfoSet(spiSetForegroundLockTimeout, 0, (nint)originalLockTimeout, 0);
         }
     }
 
@@ -166,7 +156,14 @@ public sealed class WindowService : IWindowService
 
     public WindowActionResult SetWindowState(long windowHandle, string state)
     {
-        var showCommand = state.ToLowerInvariant() switch
+        var handle = new IntPtr(windowHandle);
+        if (!IsWindow(handle))
+        {
+            throw new ArgumentException($"Window handle was not found: {windowHandle}");
+        }
+
+        var normalized = state.ToLowerInvariant();
+        var showCommand = normalized switch
         {
             "hide" => 0,
             "normal" or "restore" => 9,
@@ -175,16 +172,19 @@ public sealed class WindowService : IWindowService
             _ => throw new ArgumentException($"Unsupported window state: {state}")
         };
 
-        var completed = NativeMethods.ShowWindow(new IntPtr(windowHandle), showCommand);
-        return new WindowActionResult(windowHandle, "set_state", completed, null, state);
+        // ShowWindow returns the previous visibility state, not operation
+        // success. Issue the request, then verify observable window state.
+        _ = NativeMethods.ShowWindow(handle, showCommand);
+        var completed = VerifyWindowState(handle, normalized);
+        return new WindowActionResult(windowHandle, "set_state", completed, GetWindowBounds(handle), state);
     }
 
     public async Task<WindowDetails> WaitForWindowAsync(string? titleContains, string? className, string? processName, int? pid, int timeoutMs, CancellationToken cancellationToken, bool processNameExact = false)
     {
         var timeout = timeoutMs <= 0 ? 30000 : timeoutMs;
-        var deadline = DateTimeOffset.UtcNow.AddMilliseconds(timeout);
+        var stopwatch = Stopwatch.StartNew();
 
-        while (DateTimeOffset.UtcNow < deadline)
+        while (stopwatch.ElapsedMilliseconds < timeout)
         {
             var match = FindWindows(titleContains, className, processName, pid, visibleOnly: false, processNameExact).FirstOrDefault();
             if (match is not null)
@@ -282,7 +282,8 @@ public sealed class WindowService : IWindowService
 
     private static string GetWindowText(nint hwnd)
     {
-        var builder = new StringBuilder(512);
+        var length = Math.Max(0, GetWindowTextLength(hwnd));
+        var builder = new StringBuilder(length + 1);
         _ = NativeMethods.GetWindowText(hwnd, builder, builder.Capacity);
         return builder.ToString();
     }
@@ -303,6 +304,29 @@ public sealed class WindowService : IWindowService
 
         return new RectBounds(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
     }
+
+    private static bool VerifyWindowState(IntPtr handle, string state)
+    {
+        return state switch
+        {
+            "hide" => !NativeMethods.IsWindowVisible(handle),
+            "minimize" => NativeMethods.IsIconic(handle),
+            "maximize" => IsZoomed(handle),
+            "normal" or "restore" => NativeMethods.IsWindowVisible(handle)
+                && !NativeMethods.IsIconic(handle)
+                && !IsZoomed(handle),
+            _ => false
+        };
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsZoomed(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int GetWindowTextLength(IntPtr hWnd);
 
     private static string GetProcessName(int processId)
     {

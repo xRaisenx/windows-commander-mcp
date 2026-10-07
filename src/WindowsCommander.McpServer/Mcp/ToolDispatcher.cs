@@ -3,11 +3,14 @@ using System.Text.Json;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Safety;
 using WindowsCommander.Core.Services;
+using WindowsCommander.McpServer;
+using WindowsCommander.McpServer.CodeIntel;
 
 namespace WindowsCommander.McpServer.Mcp;
 
 public sealed class ToolDispatcher
 {
+    private object? toolListCache;
     private readonly IProcessService processService;
     private readonly IWindowService windowService;
     private readonly IScreenService screenService;
@@ -26,6 +29,10 @@ public sealed class ToolDispatcher
     private readonly IControlIndicatorService controlIndicatorService;
     private readonly IAuditLog auditLog;
     private readonly IRiskPolicyService riskPolicy;
+    private readonly Func<object>? runtimeStatusProvider;
+    private readonly ProcessOperationSupervisor? processOperations;
+    private readonly CodeIntelManager? codeIntel;
+    private readonly SerenaRescueService? serenaRescue;
     // When true, high-risk tools are gated behind a local confirmation dialog.
     // Disabled (unattended mode) for automated harness/CI runs.
     private readonly bool requireConfirmation;
@@ -73,7 +80,11 @@ public sealed class ToolDispatcher
         IControlIndicatorService controlIndicatorService,
         IAuditLog auditLog,
         IRiskPolicyService riskPolicy,
-        bool requireConfirmation)
+        bool requireConfirmation,
+        Func<object>? runtimeStatusProvider = null,
+        ProcessOperationSupervisor? processOperations = null,
+        CodeIntelManager? codeIntel = null,
+        SerenaRescueService? serenaRescue = null)
     {
         this.processService = processService;
         this.windowService = windowService;
@@ -94,11 +105,15 @@ public sealed class ToolDispatcher
         this.auditLog = auditLog;
         this.riskPolicy = riskPolicy;
         this.requireConfirmation = requireConfirmation;
+        this.runtimeStatusProvider = runtimeStatusProvider;
+        this.processOperations = processOperations;
+        this.codeIntel = codeIntel;
+        this.serenaRescue = serenaRescue;
     }
 
     public object ListTools()
     {
-        return new
+        return toolListCache ??= new
         {
             tools = new[]
             {
@@ -110,7 +125,7 @@ public sealed class ToolDispatcher
                 Tool("manage_process", "Terminates or closes a process.",
                     Int("pid", "Process id to act on.", required: true),
                     Str("action", "How to stop the process.", true, "terminate", "kill", "kill_tree", "close_main_window")),
-                Tool("list_windows", "Returns a hierarchical list of active, visible windows."),
+                Tool("list_windows", "Returns active, visible top-level windows."),
                 Tool("find_window", "Locates windows by title, class name, executable name, process ID, or visibility state.",
                     Str("title_contains", "Case-insensitive substring to match against window titles."),
                     Str("class_name", "Exact Win32 window class name to match."),
@@ -144,9 +159,8 @@ public sealed class ToolDispatcher
                     Int("x", "Target X coordinate in virtual-screen pixels."),
                     Int("y", "Target Y coordinate in virtual-screen pixels."),
                     Int("target_hwnd", "Optional window handle to resolve coordinates against.")),
-                Tool("type_text", "Injects a stream of keystrokes into the focused window.",
-                    Str("text", "Text to type into the currently focused control.", required: true),
-                    Int("speed_ms", "Delay between keystrokes in milliseconds.")),
+                Tool("type_text", "Pastes Unicode text into the focused control while preserving clipboard ownership.",
+                    Str("text", "Text to type into the currently focused control.", required: true)),
                 Tool("send_hotkey", "Executes keyboard shortcuts.",
                     StrArray("modifiers", "Modifier keys held down, e.g. ctrl, alt, shift, win.", required: true),
                     Str("key", "Primary key pressed while the modifiers are held.", required: true)),
@@ -250,24 +264,25 @@ public sealed class ToolDispatcher
                     Bool("include_hidden", "Include hidden and system entries when true."),
                     Str("pattern", "Optional wildcard filename pattern, e.g. *.txt."),
                     Int("max_results", "Maximum number of entries to return (default 1000, maximum 5000).")),
-                Tool("read_file", "Reads text or binary file content with encoding detection.",
+                Tool("read_file", "Reads text or binary file content; text defaults to UTF-8 unless encoding is supplied.",
                     Str("path", "File path to read.", required: true),
                     Str("encoding", "Text encoding name, e.g. utf-8, utf-16, ascii."),
                     Int("max_bytes", "Maximum number of bytes to read."),
                     Bool("as_base64", "Return raw bytes as base64 instead of decoded text.")),
-                Tool("write_file", "Writes file content with explicit overwrite control.",
+                Tool("write_file", "Writes file content atomically with explicit overwrite and optional stale-read protection.",
                     Str("path", "File path to write.", required: true),
                     Str("content", "Content to write to the file.", required: true),
                     Str("encoding", "Text encoding name, e.g. utf-8."),
                     Bool("overwrite", "Overwrite an existing file when true."),
-                    Bool("create_directories", "Create missing parent directories when true.")),
-                Tool("copy_move_delete_path", "Copies, moves, deletes, or sends files and directories to the recycle bin.",
-                    Str("action", "File system operation to perform.", true, "copy", "move", "delete", "recycle"),
+                    Bool("create_directories", "Create missing parent directories when true."),
+                    Str("expected_sha256", "Optional SHA-256 of the currently observed target; the write is rejected if the target changed.")),
+                Tool("copy_move_delete_path", "Copies, moves, or permanently deletes files and directories.",
+                    Str("action", "File system operation to perform.", true, "copy", "move", "delete"),
                     Str("source_path", "Source file or directory path.", required: true),
                     Str("destination_path", "Destination path for copy and move actions."),
                     Bool("recursive", "Apply the action recursively to directories when true."),
                     Bool("overwrite", "Overwrite an existing destination when true.")),
-                Tool("get_file_properties", "Retrieves file metadata, version info, hashes, and security descriptor summary.",
+                Tool("get_file_properties", "Retrieves file metadata, version info, and optional content hashes.",
                     Str("path", "File path to inspect.", required: true),
                     Str("hash_algorithm", "Optional content hash to compute.", false, "SHA256", "SHA1", "MD5")),
                 Tool("open_path", "Opens a file, folder, URI, or shell verb using the Windows shell.",
@@ -324,7 +339,60 @@ public sealed class ToolDispatcher
                     Int("timeout_ms", "How long to wait for a response in milliseconds.")),
                 Tool("get_operation_history", "Returns a bounded audit log of recent tool executions.",
                     Int("limit", "Maximum number of audit entries to return (default 50)."),
-                    Bool("include_sensitive_arguments", "Include raw tool arguments in the output when true."))
+                    Bool("include_sensitive_arguments", "Include raw tool arguments in the output when true.")),
+                Tool("get_runtime_status", "Returns Windows Commander rescue health, queue state, policy, and build identity without probing Serena."),
+                Tool("start_process_operation", "Starts a bounded long-running process operation and returns immediately with an operation id.",
+                    Str("executable_path", "Executable path or command to start.", required: true),
+                    StrArray("arguments", "Optional process arguments."),
+                    Str("working_directory", "Optional working directory."),
+                    Int("timeout_ms", "Operation timeout in milliseconds."),
+                    Int("max_output_bytes", "Combined bounded stdout/stderr budget.")),
+                Tool("get_process_operation", "Gets current state and bounded output for a long-running process operation.",
+                    Str("operation_id", "Operation id returned by start_process_operation.", required: true)),
+                Tool("cancel_process_operation", "Cancels an owned long-running process operation and its process tree.",
+                    Str("operation_id", "Operation id returned by start_process_operation.", required: true)),
+                Tool("codeintel_start", "Starts an isolated language-server session for semantic rescue operations.",
+                    Str("executable_path", "Language server executable path.", required: true),
+                    StrArray("arguments", "Language server arguments."),
+                    Str("workspace_root", "Workspace root for the language server.", required: true),
+                    Str("language_id", "LSP language id such as csharp, typescript, javascript, or python.", required: true)),
+                Tool("codeintel_status", "Returns status for an isolated semantic rescue session.",
+                    Str("session_id", "CodeIntel session id.", required: true)),
+                Tool("codeintel_symbols", "Returns semantic document symbols for a source file.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true)),
+                Tool("codeintel_definition", "Resolves a semantic definition from an LSP position.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true),
+                    Int("line", "Zero-based line.", required: true),
+                    Int("character", "Zero-based UTF-16 character offset.", required: true)),
+                Tool("codeintel_references", "Returns semantic references for an LSP position.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true),
+                    Int("line", "Zero-based line.", required: true),
+                    Int("character", "Zero-based UTF-16 character offset.", required: true),
+                    Bool("include_declaration", "Include the declaration in references.")),
+                Tool("codeintel_diagnostics", "Returns current language-server diagnostics for a source file.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true)),
+                Tool("codeintel_safe_delete_preflight", "Checks semantic references before a caller deletes a symbol.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true),
+                    Int("line", "Zero-based line on the symbol.", required: true),
+                    Int("character", "Zero-based UTF-16 character offset on the symbol.", required: true)),
+                Tool("codeintel_replace_symbol", "Replaces one semantic symbol body with stale-read protection and rollback if diagnostics worsen.",
+                    Str("session_id", "CodeIntel session id.", required: true),
+                    Str("path", "Source file path.", required: true),
+                    Str("symbol_name", "Exact semantic symbol name.", required: true),
+                    Str("replacement", "Replacement text for the resolved symbol range.", required: true)),
+                Tool("codeintel_stop", "Stops an isolated semantic rescue session.",
+                    Str("session_id", "CodeIntel session id.", required: true)),
+                Tool("serena_rescue_status", "Checks configured Serena root, startup script, router listener, and master listener without requiring Serena itself."),
+                Tool("serena_rescue_restart", "Starts the configured Serena recovery script as a durable process operation.",
+                    Int("timeout_ms", "Maximum recovery operation time in milliseconds.")),
+                Tool("serena_rescue_logs", "Returns bounded tails from the newest Serena log files.",
+                    Int("max_files", "Maximum log files to return."),
+                    Int("lines_per_file", "Maximum lines to return per file."))
             }
         };
     }
@@ -606,10 +674,183 @@ public sealed class ToolDispatcher
             "get_control_indicator_status" => DispatchControlIndicatorTool(name, arguments, cancellationToken),
             "request_user_confirmation" => DispatchControlIndicatorTool(name, arguments, cancellationToken),
             "get_operation_history" => DispatchAuditTool(name, arguments, cancellationToken),
-            _ => throw new ArgumentException($"Unknown tool: {name}")
+            "get_runtime_status" => runtimeStatusProvider?.Invoke() ?? new
+            {
+                healthy = true,
+                process_id = Environment.ProcessId,
+                server = ServerInfo.Name,
+                version = ServerInfo.Version
+            },
+            "start_process_operation" => (processOperations ?? throw new InvalidOperationException("Process operation supervisor is unavailable.")).Start(
+                GetRequiredString(arguments, "executable_path"),
+                GetStringArray(arguments, "arguments"),
+                GetString(arguments, "working_directory"),
+                GetInt(arguments, "timeout_ms"),
+                GetInt(arguments, "max_output_bytes")),
+            "get_process_operation" => (processOperations ?? throw new InvalidOperationException("Process operation supervisor is unavailable.")).Get(
+                GetRequiredString(arguments, "operation_id")),
+            "cancel_process_operation" => (processOperations ?? throw new InvalidOperationException("Process operation supervisor is unavailable.")).Cancel(
+                GetRequiredString(arguments, "operation_id")),
+            "codeintel_start" or "codeintel_status" or "codeintel_symbols" or "codeintel_definition"
+                or "codeintel_references" or "codeintel_diagnostics" or "codeintel_safe_delete_preflight"
+                or "codeintel_replace_symbol" or "codeintel_stop"
+                => await DispatchCodeIntelToolAsync(name, arguments, cancellationToken),
+            "serena_rescue_status" or "serena_rescue_restart" or "serena_rescue_logs"
+                => await DispatchSerenaRescueToolAsync(name, arguments, cancellationToken),            _ => throw new ArgumentException($"Unknown tool: {name}")
         };
     }
 
+    private async Task<object> DispatchCodeIntelToolAsync(
+        string name,
+        JsonElement? arguments,
+        CancellationToken cancellationToken)
+    {
+        var manager = codeIntel ?? throw new InvalidOperationException("CodeIntel rescue manager is unavailable.");
+
+        return name switch
+        {
+            "codeintel_start" => await manager.StartAsync(
+                GetRequiredString(arguments, "executable_path"),
+                GetStringArray(arguments, "arguments") ?? Array.Empty<string>(),
+                GetRequiredString(arguments, "workspace_root"),
+                GetRequiredString(arguments, "language_id"),
+                cancellationToken),
+            "codeintel_status" => manager.Status(GetRequiredString(arguments, "session_id")),
+            "codeintel_symbols" => await manager.SymbolsAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                cancellationToken),
+            "codeintel_definition" => await manager.DefinitionAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                GetRequiredInt(arguments, "line"),
+                GetRequiredInt(arguments, "character"),
+                cancellationToken),
+            "codeintel_references" => await manager.ReferencesAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                GetRequiredInt(arguments, "line"),
+                GetRequiredInt(arguments, "character"),
+                GetBool(arguments, "include_declaration") ?? false,
+                cancellationToken),
+            "codeintel_diagnostics" => await manager.DiagnosticsAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                cancellationToken),
+            "codeintel_safe_delete_preflight" => await manager.SafeDeletePreflightAsync(
+                GetRequiredString(arguments, "session_id"),
+                GetRequiredString(arguments, "path"),
+                GetRequiredInt(arguments, "line"),
+                GetRequiredInt(arguments, "character"),
+                cancellationToken),
+            "codeintel_replace_symbol" => await ReplaceCodeIntelSymbolAsync(manager, arguments, cancellationToken),
+            "codeintel_stop" => await manager.StopAsync(GetRequiredString(arguments, "session_id")),
+            _ => throw new ArgumentException($"Unknown CodeIntel tool: {name}")
+        };
+    }
+
+    private async Task<object> ReplaceCodeIntelSymbolAsync(
+        CodeIntelManager manager,
+        JsonElement? arguments,
+        CancellationToken cancellationToken)
+    {
+        var sessionId = GetRequiredString(arguments, "session_id");
+        var path = GetRequiredString(arguments, "path");
+        var symbolName = GetRequiredString(arguments, "symbol_name");
+        var replacement = GetRequiredString(arguments, "replacement");
+
+        var beforeErrors = await manager.ErrorCountAsync(sessionId, path, cancellationToken);
+        var proposal = await manager.CreateReplacementProposalAsync(
+            sessionId,
+            path,
+            symbolName,
+            replacement,
+            cancellationToken);
+
+        var write = await fileSystemService.WriteFileAsync(
+            proposal.Path,
+            proposal.NewText,
+            encoding: null,
+            overwrite: true,
+            createDirectories: false,
+            expectedSha256: proposal.ExpectedSha256,
+            cancellationToken);
+
+        var current = await fileSystemService.GetFilePropertiesAsync(
+            proposal.Path,
+            "SHA256",
+            cancellationToken);
+        var appliedSha = current.Hash
+            ?? throw new InvalidOperationException("Unable to establish post-write SHA-256.");
+
+        await manager.RefreshDocumentAsync(sessionId, proposal.Path, cancellationToken);
+        var afterErrors = await manager.ErrorCountAsync(sessionId, proposal.Path, cancellationToken);
+
+        if (afterErrors > beforeErrors)
+        {
+            await fileSystemService.WriteFileAsync(
+                proposal.Path,
+                proposal.OriginalText,
+                encoding: null,
+                overwrite: true,
+                createDirectories: false,
+                expectedSha256: appliedSha,
+                cancellationToken);
+
+            await manager.RefreshDocumentAsync(sessionId, proposal.Path, cancellationToken);
+
+            return new
+            {
+                applied = false,
+                rolled_back = true,
+                reason = "Language-server error count increased after the replacement.",
+                before_errors = beforeErrors,
+                after_errors = afterErrors,
+                symbol = proposal.SymbolName,
+                path = proposal.Path,
+                range = new
+                {
+                    start = new { line = proposal.StartLine, character = proposal.StartCharacter },
+                    end = new { line = proposal.EndLine, character = proposal.EndCharacter }
+                }
+            };
+        }
+
+        return new
+        {
+            applied = true,
+            rolled_back = false,
+            before_errors = beforeErrors,
+            after_errors = afterErrors,
+            symbol = proposal.SymbolName,
+            path = proposal.Path,
+            bytes_written = write.BytesWritten,
+            sha256 = appliedSha,
+            range = new
+            {
+                start = new { line = proposal.StartLine, character = proposal.StartCharacter },
+                end = new { line = proposal.EndLine, character = proposal.EndCharacter }
+            }
+        };
+    }
+
+    private async Task<object> DispatchSerenaRescueToolAsync(
+        string name,
+        JsonElement? arguments,
+        CancellationToken cancellationToken)
+    {
+        var rescue = serenaRescue ?? throw new InvalidOperationException("Serena rescue service is unavailable.");
+
+        return name switch
+        {
+            "serena_rescue_status" => await rescue.GetStatusAsync(cancellationToken),
+            "serena_rescue_restart" => rescue.Restart(GetInt(arguments, "timeout_ms")),
+            "serena_rescue_logs" => rescue.GetRecentLogs(
+                GetInt(arguments, "max_files"),
+                GetInt(arguments, "lines_per_file")),
+            _ => throw new ArgumentException($"Unknown Serena rescue tool: {name}")
+        };
+    }
     private object DispatchProcessTool(string name, JsonElement? arguments, CancellationToken cancellationToken)
     {
         return name switch
@@ -664,7 +905,7 @@ public sealed class ToolDispatcher
                 GetInt(arguments, "x"),
                 GetInt(arguments, "y"),
                 GetLong(arguments, "target_hwnd")),
-            "type_text" => await inputService.TypeTextAsync(GetRequiredString(arguments, "text"), GetInt(arguments, "speed_ms"), cancellationToken),
+            "type_text" => await inputService.TypeTextAsync(GetRequiredString(arguments, "text"), null, cancellationToken),
             "send_hotkey" => inputService.SendHotkey(GetRequiredStringArray(arguments, "modifiers"), GetRequiredString(arguments, "key")),
             "keyboard_action" => await inputService.KeyboardActionAsync(
                 GetRequiredString(arguments, "action"),
@@ -807,6 +1048,7 @@ public sealed class ToolDispatcher
                 GetString(arguments, "encoding"),
                 GetBool(arguments, "overwrite") ?? false,
                 GetBool(arguments, "create_directories") ?? false,
+                GetString(arguments, "expected_sha256"),
                 cancellationToken),
             "copy_move_delete_path" => await fileSystemService.CopyMoveDeletePathAsync(
                 GetRequiredString(arguments, "action"),
@@ -930,7 +1172,8 @@ public sealed class ToolDispatcher
         var schema = new Dictionary<string, object>
         {
             ["type"] = "object",
-            ["properties"] = properties
+            ["properties"] = properties,
+            ["additionalProperties"] = false
         };
 
         if (required.Count > 0)

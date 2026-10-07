@@ -36,4 +36,37 @@ public class ExecutionServiceCancellationTests
             }
         }
     }
+
+    [Fact]
+    public async Task ExecuteProcessAsync_WaitForExit_PreservesRealPid()
+    {
+        var service = new ExecutionService();
+        var result = await service.ExecuteProcessAsync(
+            "pwsh.exe",
+            new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "exit 0" },
+            workingDirectory: null,
+            timeoutMs: 5000,
+            waitForExit: true,
+            CancellationToken.None);
+
+        Assert.True(result.ProcessId > 0);
+        Assert.Equal(0, result.ExitCode);
+        Assert.False(result.TimedOut);
+    }
+
+    [Fact]
+    public async Task ExecutePowerShellAsync_TimeoutPreservesPartialOutput()
+    {
+        var service = new ExecutionService();
+        var result = await service.ExecutePowerShellAsync(
+            "[Console]::Out.WriteLine('before-timeout'); [Console]::Out.Flush(); Start-Sleep -Seconds 10",
+            workingDirectory: null,
+            timeoutMs: 3000,
+            environment: null,
+            CancellationToken.None);
+
+        Assert.True(result.TimedOut);
+        Assert.Contains("before-timeout", result.StandardOutput);
+        Assert.Contains("timed out", result.StandardError, StringComparison.OrdinalIgnoreCase);
+    }
 }

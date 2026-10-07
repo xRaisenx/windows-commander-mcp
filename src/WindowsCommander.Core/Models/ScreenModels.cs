@@ -7,12 +7,12 @@ public sealed record ScreenDetails(
     bool IsPrimary,
     RectBounds Bounds,
     RectBounds WorkingArea,
-    double DpiScale,
+    double? DpiScale,
     string Orientation,
     string Resolution,
-    int ColorDepth,
-    int RefreshRate,
-    string AdapterName,
+    int? ColorDepth,
+    int? RefreshRate,
+    string? AdapterName,
     bool IsActive);
 
 public sealed record ScreenAtPoint(

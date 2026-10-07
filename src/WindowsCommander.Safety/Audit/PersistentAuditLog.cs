@@ -8,6 +8,7 @@ public sealed class PersistentAuditLog : IAuditLog
 {
     private const long CompactThresholdBytes = 4L * 1024L * 1024L;
     private const string RedactedValue = "***REDACTED***";
+
     private static readonly HashSet<string> AlwaysRedactedKeys = new(StringComparer.OrdinalIgnoreCase)
     {
         "arguments",
@@ -18,7 +19,14 @@ public sealed class PersistentAuditLog : IAuditLog
         "value"
     };
 
+    private static readonly string[] SensitiveNameMarkers =
+    {
+        "password", "passwd", "token", "secret", "api_key", "apikey",
+        "private_key", "credential", "authorization", "connection_string"
+    };
+
     private readonly object gate = new();
+    private readonly object persistenceGate = new();
     private readonly Queue<AuditEntry> entries = new();
     private readonly int capacity;
     private readonly string path;
@@ -38,28 +46,10 @@ public sealed class PersistentAuditLog : IAuditLog
         {
             entries.Enqueue(entry);
             TrimToCapacity();
-
-            try
-            {
-                var persisted = entry with { RedactedArguments = Redact(entry.RedactedArguments) };
-                var directory = System.IO.Path.GetDirectoryName(path);
-                if (!string.IsNullOrWhiteSpace(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-
-                File.AppendAllText(path, JsonSerializer.Serialize(persisted) + Environment.NewLine);
-
-                if (new FileInfo(path).Length > CompactThresholdBytes)
-                {
-                    Compact();
-                }
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
-            {
-                Console.Error.WriteLine($"Failed to persist Windows Commander audit entry: {exception.Message}");
-            }
         }
+
+        var persisted = entry with { RedactedArguments = Redact(entry.RedactedArguments) };
+        PersistOne(persisted);
     }
 
     public IReadOnlyList<AuditEntry> GetRecent(int limit, bool includeSensitiveArguments)
@@ -73,6 +63,31 @@ public sealed class PersistentAuditLog : IAuditLog
                     ? entry
                     : entry with { RedactedArguments = Redact(entry.RedactedArguments) })
                 .ToArray();
+        }
+    }
+
+    private void PersistOne(AuditEntry persisted)
+    {
+        lock (persistenceGate)
+        {
+            try
+            {
+                var directory = System.IO.Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                File.AppendAllText(path, JsonSerializer.Serialize(persisted) + Environment.NewLine);
+
+                if (new FileInfo(path).Length > CompactThresholdBytes)
+                {
+                    Compact();
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+            {
+                Console.Error.WriteLine($"Failed to persist Windows Commander audit entry: {exception.Message}");
+            }
         }
     }
 
@@ -112,6 +127,14 @@ public sealed class PersistentAuditLog : IAuditLog
 
     private void Compact()
     {
+        AuditEntry[] snapshot;
+        lock (gate)
+        {
+            snapshot = entries
+                .Select(entry => entry with { RedactedArguments = Redact(entry.RedactedArguments) })
+                .ToArray();
+        }
+
         var directory = System.IO.Path.GetDirectoryName(path);
         if (!string.IsNullOrWhiteSpace(directory))
         {
@@ -119,10 +142,7 @@ public sealed class PersistentAuditLog : IAuditLog
         }
 
         var tempPath = path + ".tmp";
-        var lines = entries
-            .Select(entry => entry with { RedactedArguments = Redact(entry.RedactedArguments) })
-            .Select(entry => JsonSerializer.Serialize(entry));
-
+        var lines = snapshot.Select(entry => JsonSerializer.Serialize(entry));
         File.WriteAllLines(tempPath, lines);
         File.Move(tempPath, path, overwrite: true);
     }
@@ -137,15 +157,15 @@ public sealed class PersistentAuditLog : IAuditLog
 
     private static string ResolvePath(string? configuredPath)
     {
-        var path = configuredPath;
-        if (string.IsNullOrWhiteSpace(path))
+        var candidate = configuredPath;
+        if (string.IsNullOrWhiteSpace(candidate))
         {
-            path = Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_AUDIT_LOG");
+            candidate = Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_AUDIT_LOG");
         }
 
-        if (!string.IsNullOrWhiteSpace(path))
+        if (!string.IsNullOrWhiteSpace(candidate))
         {
-            return System.IO.Path.GetFullPath(Environment.ExpandEnvironmentVariables(path));
+            return System.IO.Path.GetFullPath(Environment.ExpandEnvironmentVariables(candidate));
         }
 
         return System.IO.Path.Combine(
@@ -189,7 +209,7 @@ public sealed class PersistentAuditLog : IAuditLog
                 property => RedactValue(property.Name, property.Value),
                 StringComparer.OrdinalIgnoreCase),
             JsonValueKind.Array => element.EnumerateArray()
-                .Select(item => RedactJsonElement(item))
+                .Select(RedactJsonElement)
                 .ToArray(),
             JsonValueKind.String => element.GetString(),
             JsonValueKind.Number when element.TryGetInt64(out var integer) => integer,
@@ -203,10 +223,12 @@ public sealed class PersistentAuditLog : IAuditLog
 
     private static bool IsSensitive(string key)
     {
-        return AlwaysRedactedKeys.Contains(key)
-            || key.Contains("password", StringComparison.OrdinalIgnoreCase)
-            || key.Contains("token", StringComparison.OrdinalIgnoreCase)
-            || key.Contains("secret", StringComparison.OrdinalIgnoreCase)
-            || key.Contains("key", StringComparison.OrdinalIgnoreCase);
+        if (AlwaysRedactedKeys.Contains(key))
+        {
+            return true;
+        }
+
+        return SensitiveNameMarkers.Any(marker =>
+            key.Contains(marker, StringComparison.OrdinalIgnoreCase));
     }
 }

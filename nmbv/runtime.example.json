@@ -1,7 +1,15 @@
 {
+  "schemaVersion": 2,
   "alias": "nmbv-windows-commander",
   "tunnelId": "tunnel_REPLACE_WITH_WINDOWS_COMMANDER_TUNNEL_ID",
   "runtimeApiKeyRef": "env:CONTROL_PLANE_API_KEY",
   "tunnelClientPath": "D:\\path\\to\\tunnel-client.exe",
-  "executable": "D:/path/to/WindowsCommander.McpServer.exe"
+  "executable": "D:/path/to/WindowsCommander.McpServer.exe",
+  "instanceKey": "nmbv-windows-commander",
+  "unattended": true,
+  "maxConcurrency": 6,
+  "requestTimeoutMs": 90000,
+  "activityLogPath": "%LOCALAPPDATA%\\WindowsCommander\\activity.jsonl",
+  "serenaRoot": "D:\\path\\to\\project",
+  "serenaStartScript": "D:\\path\\to\\project\\Start-NMBV-Serena.ps1"
 }
