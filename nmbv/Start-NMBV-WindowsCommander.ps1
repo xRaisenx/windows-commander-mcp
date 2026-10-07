@@ -63,15 +63,15 @@ function Stop-UnmanagedRawProfileOwners {
   }
 }
 
+# Enforce one ownership model per alias before accepting a healthy managed
+# runtime. A manually launched "tunnel-client run --profile <alias>" process
+# can coexist with a healthy managed runtime and recreate split-brain ownership.
+Stop-UnmanagedRawProfileOwners
+
 $s=Status
 if(Test-ManagedReady $s){
   return
 }
-
-# Enforce one ownership model per alias. A manually launched
-# "tunnel-client run --profile <alias>" process can keep the health URL live
-# while the managed runtime record is stopped, creating split-brain readiness.
-Stop-UnmanagedRawProfileOwners
 
 if($s){
   $stop=Invoke-TunnelClient @('runtimes','stop',$cfg.alias,'--json')
