@@ -33,11 +33,12 @@ internal sealed class LspClient : IAsyncDisposable
 
     public int ProcessId => process.Id;
     public bool IsAlive => !process.HasExited;
-
     public static async Task<LspClient> StartAsync(
         string executable,
         IReadOnlyList<string> arguments,
         string workspaceRoot,
+        string? tsserverPath,
+        string? tsserverFallbackPath,
         CancellationToken cancellationToken)
     {
         var startInfo = new ProcessStartInfo(executable)
@@ -63,12 +64,26 @@ internal sealed class LspClient : IAsyncDisposable
         try
         {
             var rootUri = new Uri(Path.GetFullPath(workspaceRoot)).AbsoluteUri;
-            _ = await client.RequestAsync("initialize", new
+            var resolvedTsserverPath = string.IsNullOrWhiteSpace(tsserverPath)
+                ? null
+                : Path.GetFullPath(tsserverPath, workspaceRoot);
+            var resolvedTsserverFallbackPath = string.IsNullOrWhiteSpace(tsserverFallbackPath)
+                ? null
+                : Path.GetFullPath(tsserverFallbackPath, workspaceRoot);
+
+            var initializeParameters = new Dictionary<string, object?>
             {
-                processId = Environment.ProcessId,
-                rootUri,
-                workspaceFolders = new[] { new { uri = rootUri, name = Path.GetFileName(Path.GetFullPath(workspaceRoot).TrimEnd(Path.DirectorySeparatorChar)) } },
-                capabilities = new
+                ["processId"] = Environment.ProcessId,
+                ["rootUri"] = rootUri,
+                ["workspaceFolders"] = new[]
+                {
+                    new
+                    {
+                        uri = rootUri,
+                        name = Path.GetFileName(Path.GetFullPath(workspaceRoot).TrimEnd(Path.DirectorySeparatorChar))
+                    }
+                },
+                ["capabilities"] = new
                 {
                     textDocument = new
                     {
@@ -78,8 +93,33 @@ internal sealed class LspClient : IAsyncDisposable
                     },
                     workspace = new { workspaceFolders = true }
                 },
-                clientInfo = new { name = "windows-commander-rescue", version = ServerInfo.Version }
-            }, TimeSpan.FromSeconds(15), cancellationToken);
+                ["clientInfo"] = new { name = "windows-commander-rescue", version = ServerInfo.Version }
+            };
+
+            if (resolvedTsserverPath is not null || resolvedTsserverFallbackPath is not null)
+            {
+                var tsserverOptions = new Dictionary<string, object?>();
+                if (resolvedTsserverPath is not null)
+                {
+                    tsserverOptions["path"] = resolvedTsserverPath;
+                }
+
+                if (resolvedTsserverFallbackPath is not null)
+                {
+                    tsserverOptions["fallbackPath"] = resolvedTsserverFallbackPath;
+                }
+
+                initializeParameters["initializationOptions"] = new Dictionary<string, object?>
+                {
+                    ["tsserver"] = tsserverOptions
+                };
+            }
+
+            _ = await client.RequestAsync(
+                "initialize",
+                initializeParameters,
+                TimeSpan.FromSeconds(15),
+                cancellationToken);
 
             await client.NotifyAsync("initialized", new { }, cancellationToken);
             return client;
@@ -90,7 +130,6 @@ internal sealed class LspClient : IAsyncDisposable
             throw;
         }
     }
-
     public async Task OpenDocumentAsync(string path, string languageId, CancellationToken cancellationToken)
     {
         var fullPath = Path.GetFullPath(path);
