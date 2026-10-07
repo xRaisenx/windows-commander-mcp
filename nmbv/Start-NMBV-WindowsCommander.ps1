@@ -132,7 +132,13 @@ if($s){
 
   $rm=Invoke-TunnelClient @('runtimes','rm',$cfg.alias,'--json')
   if($rm.ExitCode -ne 0 -and $rm.Output -notmatch '(?i)(not known|does not exist|not found)'){
-    throw "Unable to remove unhealthy Windows Commander runtime: $($rm.Output.Trim())"
+    # runtimes rm can remove the managed alias/process but still report a
+    # cleanup error when an old log/health file is momentarily locked. Re-read
+    # authoritative runtime state before treating the command result as fatal.
+    $postRemove=Status
+    if($postRemove -and (Get-ObjectProperty $postRemove 'process_running' $false) -eq $true){
+      throw "Unable to remove unhealthy Windows Commander runtime: $($rm.Output.Trim())"
+    }
   }
 }
 
