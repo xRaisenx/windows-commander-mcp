@@ -2,7 +2,7 @@
 param(
   [string]$EventLogPath = (Join-Path $env:LOCALAPPDATA 'WindowsCommander\activity.jsonl'),
   [ValidateRange(100,5000)][int]$RefreshMs = 250,
-  [ValidateRange(6,40)][int]$MaxRows = 14,
+  [ValidateRange(6,40)][int]$MaxRows = 10,
   [ValidateRange(250,60000)][int]$SlowMs = 1000,
   [ValidateRange(1000,120000)][int]$StallMs = 10000,
   [switch]$Once
@@ -87,7 +87,7 @@ function Header([int]$Width,[DateTimeOffset]$Now){
   Border $Width Cyan
   C '| ' DarkCyan -N
   C 'WINDOWS COMMANDER' White -N
-  C ' RESCUE ' Black -N
+  C ' RESCUE ' Cyan -N
   C (Pad ' LIVE CONTROL CENTER ' ($Width-29)) White -N
   C '|' DarkCyan
   $sub=' Fast | Reliable | Isolated | Observable'
@@ -145,23 +145,27 @@ function Activity($Ops,[int]$Width,[DateTimeOffset]$Now){
   }
   Border $Width Cyan
 }
-function Dual($Mutation,$Failure,[int]$Width,[DateTimeOffset]$Now){
+function Dual($Mutation,$Alert,[int]$Width,[DateTimeOffset]$Now){
   $gap=3;$lw=[Math]::Floor(($Width-$gap)/2);$rw=$Width-$gap-$lw
   C ('+'+(Pad ' LAST MUTATION ' ($lw-2))+'+') Magenta -N
   C (' '*$gap) DarkGray -N
-  C ('+'+(Pad ' LAST FAILURE ' ($rw-2))+'+') $(if($Failure){'Red'}else{'Green'})
+  C ('+'+(Pad ' CURRENT ALERT ' ($rw-2))+'+') $(if($Alert){'Red'}else{'Green'})
   if($Mutation){
     $mms=LiveMs $Mutation $Now
     $m1="$(Badge ([string]$Mutation.State) $mms)  $($Mutation.Operation)  $mms ms"
     $m2='WHAT: '+(Clip ([string]$Mutation.Detail) ($lw-10))
     $mc=StateColor ([string]$Mutation.State) $mms
   }else{$m1='none';$m2='No mutation in current activity window.';$mc='DarkGray'}
-  if($Failure){
-    $fms=LiveMs $Failure $Now
-    $f1="$(Badge ([string]$Failure.State) $fms)  $($Failure.Operation)  $fms ms"
-    $f2='WHY: '+(Clip ([string]$Failure.Detail) ($rw-10))
+  if($Alert){
+    $fms=LiveMs $Alert $Now
+    $f1="$(Badge ([string]$Alert.State) $fms)  $($Alert.Operation)  $fms ms"
+    if($Alert.State -eq 'RUNNING'){
+      $f2='WHY: operation has exceeded the slow/stall threshold and is still running.'
+    }else{
+      $f2='WHY: '+(Clip ([string]$Alert.Detail) ($rw-10))
+    }
     $fc='Red'
-  }else{$f1='none';$f2='No recent failed, blocked, or timed-out operations.';$fc='Green'}
+  }else{$f1='none';$f2='No failed, blocked, timed-out, slow, or stalled operations.';$fc='Green'}
   foreach($pair in @(@($m1,$f1),@($m2,$f2))){
     C ('|'+(Pad (' '+$pair[0]) ($lw-2))+'|') $mc -N
     C (' '*$gap) DarkGray -N
@@ -169,7 +173,7 @@ function Dual($Mutation,$Failure,[int]$Width,[DateTimeOffset]$Now){
   }
   C ('+'+(Line ($lw-2) '-')+'+') Magenta -N
   C (' '*$gap) DarkGray -N
-  C ('+'+(Line ($rw-2) '-')+'+') $(if($Failure){'Red'}else{'Green'})
+  C ('+'+(Line ($rw-2) '-')+'+') $(if($Alert){'Red'}else{'Green'})
 }
 function Footer([int]$Width,$Active,$Queued,$Failed,$P95){
   $status=if($Failed){'ATTENTION'}elseif($P95 -ge $StallMs){'STALL RISK'}elseif($Active){'WORKING'}else{'READY'}
@@ -197,14 +201,20 @@ while($true){
   $median=Pct $samples 50
   $p95=Pct $samples 95
   $mut=@($ops|Where-Object Lane -eq 'MUTATE');$mutation=if($mut.Count){$mut[-1]}else{$null}
-  $fail=@($ops|Where-Object {$_.State -in @('FAILED','TIMEOUT','BLOCKED')});$failure=if($fail.Count){$fail[-1]}else{$null}
+  $alerts=@(
+    $ops | Where-Object {
+      $_.State -in @('FAILED','TIMEOUT','BLOCKED') -or
+      ($_.State -eq 'RUNNING' -and (LiveMs $_ $now) -ge $SlowMs)
+    }
+  )
+  $alert=if($alerts.Count){$alerts[-1]}else{$null}
   $width=148
   try{$width=[Math]::Max(112,[Math]::Min(180,$Host.UI.RawUI.WindowSize.Width))}catch{}
   if($first){Clear-Host;$first=$false}else{try{[Console]::SetCursorPosition(0,0)}catch{Clear-Host}}
   Header $width $now
   Cards $width $active $queued $success $failed $median $p95
   Activity $ops $width $now
-  Dual $mutation $failure $width $now
+  Dual $mutation $alert $width $now
   Footer $width $active $queued $failed $p95
   if($Once){break}
   Start-Sleep -Milliseconds $RefreshMs
