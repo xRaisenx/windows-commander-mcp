@@ -9,7 +9,13 @@ namespace WindowsCommander.Windows.Services;
 
 public sealed class FileSystemService : IFileSystemService
 {
-    public IReadOnlyList<DirectoryEntry> ListDirectory(string path, bool recursive, bool includeHidden, string? pattern)
+    public IReadOnlyList<DirectoryEntry> ListDirectory(
+        string path,
+        bool recursive,
+        bool includeHidden,
+        string? pattern,
+        int? maxResults,
+        CancellationToken cancellationToken)
     {
         var directory = new DirectoryInfo(NormalizeExistingDirectory(path));
         var options = new EnumerationOptions
@@ -18,11 +24,21 @@ public sealed class FileSystemService : IFileSystemService
             IgnoreInaccessible = true,
             AttributesToSkip = includeHidden ? 0 : FileAttributes.Hidden | FileAttributes.System
         };
+        var limit = Math.Clamp(maxResults ?? 1000, 1, 5000);
+        var results = new List<DirectoryEntry>(Math.Min(limit, 256));
 
-        return directory
-            .EnumerateFileSystemInfos(string.IsNullOrWhiteSpace(pattern) ? "*" : pattern, options)
-            .Select(ToDirectoryEntry)
-            .ToArray();
+        foreach (var entry in directory.EnumerateFileSystemInfos(string.IsNullOrWhiteSpace(pattern) ? "*" : pattern, options))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            results.Add(ToDirectoryEntry(entry));
+
+            if (results.Count >= limit)
+            {
+                break;
+            }
+        }
+
+        return results;
     }
 
     public async Task<FileReadResult> ReadFileAsync(string path, string? encoding, int? maxBytes, bool asBase64, CancellationToken cancellationToken)
@@ -81,7 +97,7 @@ public sealed class FileSystemService : IFileSystemService
         switch (action.ToLowerInvariant())
         {
             case "copy":
-                CopyPath(sourceFullPath, RequireDestination(destinationFullPath), recursive, overwrite);
+                CopyPath(sourceFullPath, RequireDestination(destinationFullPath), recursive, overwrite, cancellationToken);
                 break;
             case "move":
                 MovePath(sourceFullPath, RequireDestination(destinationFullPath), overwrite);
@@ -121,13 +137,21 @@ public sealed class FileSystemService : IFileSystemService
             hash);
     }
 
-    public IReadOnlyList<FileSearchResult> SearchFiles(IReadOnlyList<string> roots, string? namePattern, string? contentQuery, bool includeHidden, int? maxResults)
+    public IReadOnlyList<FileSearchResult> SearchFiles(
+        IReadOnlyList<string> roots,
+        string? namePattern,
+        string? contentQuery,
+        bool includeHidden,
+        int? maxResults,
+        CancellationToken cancellationToken)
     {
         var limit = Math.Clamp(maxResults ?? 100, 1, 1000);
         var results = new List<FileSearchResult>(limit);
 
         foreach (var root in roots)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (results.Count >= limit)
             {
                 break;
@@ -143,12 +167,14 @@ public sealed class FileSystemService : IFileSystemService
 
             foreach (var file in Directory.EnumerateFiles(rootPath, string.IsNullOrWhiteSpace(namePattern) ? "*" : namePattern, options))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 if (results.Count >= limit)
                 {
                     break;
                 }
 
-                if (!MatchesContent(file, contentQuery))
+                if (!MatchesContent(file, contentQuery, cancellationToken))
                 {
                     continue;
                 }
@@ -255,8 +281,15 @@ public sealed class FileSystemService : IFileSystemService
             : destinationPath;
     }
 
-    private static void CopyPath(string sourcePath, string destinationPath, bool recursive, bool overwrite)
+    private static void CopyPath(
+        string sourcePath,
+        string destinationPath,
+        bool recursive,
+        bool overwrite,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (File.Exists(sourcePath))
         {
             File.Copy(sourcePath, destinationPath, overwrite);
@@ -273,7 +306,7 @@ public sealed class FileSystemService : IFileSystemService
             throw new IOException("Recursive must be true to copy directories.");
         }
 
-        CopyDirectory(sourcePath, destinationPath, overwrite);
+        CopyDirectory(sourcePath, destinationPath, overwrite, cancellationToken);
     }
 
     private static void MovePath(string sourcePath, string destinationPath, bool overwrite)
@@ -314,20 +347,27 @@ public sealed class FileSystemService : IFileSystemService
         throw new FileNotFoundException($"Source path does not exist: {sourcePath}", sourcePath);
     }
 
-    private static void CopyDirectory(string sourceDirectory, string destinationDirectory, bool overwrite)
+    private static void CopyDirectory(
+        string sourceDirectory,
+        string destinationDirectory,
+        bool overwrite,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(destinationDirectory);
 
         foreach (var filePath in Directory.EnumerateFiles(sourceDirectory))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var destinationFile = Path.Combine(destinationDirectory, Path.GetFileName(filePath));
             File.Copy(filePath, destinationFile, overwrite);
         }
 
         foreach (var directoryPath in Directory.EnumerateDirectories(sourceDirectory))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var destinationSubdirectory = Path.Combine(destinationDirectory, Path.GetFileName(directoryPath));
-            CopyDirectory(directoryPath, destinationSubdirectory, overwrite);
+            CopyDirectory(directoryPath, destinationSubdirectory, overwrite, cancellationToken);
         }
     }
 
@@ -346,7 +386,7 @@ public sealed class FileSystemService : IFileSystemService
         return Convert.ToHexString(hashBytes);
     }
 
-    private static bool MatchesContent(string filePath, string? contentQuery)
+    private static bool MatchesContent(string filePath, string? contentQuery, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(contentQuery))
         {
@@ -355,7 +395,17 @@ public sealed class FileSystemService : IFileSystemService
 
         try
         {
-            return File.ReadLines(filePath).Any(line => line.Contains(contentQuery, StringComparison.OrdinalIgnoreCase));
+            foreach (var line in File.ReadLines(filePath))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (line.Contains(contentQuery, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
         catch (IOException)
         {
