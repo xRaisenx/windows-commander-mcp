@@ -489,7 +489,7 @@ static string? DescribeResult(string toolName, object result)
 {
     try
     {
-        var json = JsonSerializer.SerializeToElement(result, JsonOptions.Default);
+        var json = UnwrapToolResult(JsonSerializer.SerializeToElement(result, JsonOptions.Default));
 
         if (json.ValueKind == JsonValueKind.Array)
         {
@@ -538,6 +538,43 @@ static string? DescribeResult(string toolName, object result)
     {
         return "completed";
     }
+}
+
+static JsonElement UnwrapToolResult(JsonElement element)
+{
+    if (element.ValueKind != JsonValueKind.Object
+        || !element.TryGetProperty("content", out var content)
+        || content.ValueKind != JsonValueKind.Array)
+    {
+        return element;
+    }
+
+    foreach (var item in content.EnumerateArray())
+    {
+        if (item.ValueKind != JsonValueKind.Object
+            || !item.TryGetProperty("type", out var type)
+            || !string.Equals(type.GetString(), "text", StringComparison.Ordinal)
+            || !item.TryGetProperty("text", out var text)
+            || text.ValueKind != JsonValueKind.String)
+        {
+            continue;
+        }
+
+        var payload = text.GetString();
+        if (string.IsNullOrWhiteSpace(payload)) continue;
+
+        try
+        {
+            using var document = JsonDocument.Parse(payload);
+            return document.RootElement.Clone();
+        }
+        catch (JsonException)
+        {
+            return element;
+        }
+    }
+
+    return element;
 }
 
 static string? DescribeGenericArguments(JsonElement? arguments)
