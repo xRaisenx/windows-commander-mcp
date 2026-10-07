@@ -525,7 +525,7 @@ public sealed class ToolDispatcher
         var byteCount = Encoding.UTF8.GetByteCount(text);
         if (byteCount > MaxTextResultBytes)
         {
-            return ToErrorResult(
+            throw new InvalidOperationException(
                 $"Tool result was {byteCount} bytes, exceeding the {MaxTextResultBytes}-byte MCP text-response limit. " +
                 "Narrow the query or use bounded options such as max_results/max_bytes.");
         }
