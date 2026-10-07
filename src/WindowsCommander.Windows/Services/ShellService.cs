@@ -42,10 +42,17 @@ public sealed class ShellService : IShellService
         }
 
         var fullPath = Path.GetFullPath(path);
-        var argument = File.Exists(fullPath) ? $"/select,{fullPath}" : fullPath;
+        var isFile = File.Exists(fullPath);
+        var isDirectory = Directory.Exists(fullPath);
+        if (!isFile && !isDirectory)
+        {
+            throw new FileNotFoundException($"Path does not exist: {fullPath}", fullPath);
+        }
+
+        var argument = isFile ? $"/select,{fullPath}" : fullPath;
         _ = Process.Start(new ProcessStartInfo("explorer.exe", argument)
         {
             UseShellExecute = true
-        });
+        }) ?? throw new InvalidOperationException($"Failed to open Explorer for: {fullPath}");
     }
 }
