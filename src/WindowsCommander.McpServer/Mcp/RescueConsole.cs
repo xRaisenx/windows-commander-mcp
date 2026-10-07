@@ -21,7 +21,9 @@ internal sealed class RescueConsole : IAsyncDisposable
 
     public RescueConsole()
     {
-        consoleEnabled = !Console.IsErrorRedirected || string.Equals(
+        // Raw per-operation rows are intentionally off by default. The dedicated
+        // dashboard consumes the JSONL activity stream and renders the readable UI.
+        consoleEnabled = string.Equals(
             Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_ACTIVITY_CONSOLE"), "1", StringComparison.OrdinalIgnoreCase);
 
         // Raw ANSI sequences render as garbage in several Windows/tunnel hosts.
