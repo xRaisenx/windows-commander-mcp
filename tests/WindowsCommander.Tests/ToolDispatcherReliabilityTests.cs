@@ -101,7 +101,7 @@ public class ToolDispatcherReliabilityTests
             new InMemoryAuditLog(),
             new RiskPolicyService(),
             requireConfirmation: false,
-            toolCallTimeout,
-            maxResponseBytes);
+            toolCallTimeout: toolCallTimeout,
+            maxResponseBytes: maxResponseBytes);
     }
 }
