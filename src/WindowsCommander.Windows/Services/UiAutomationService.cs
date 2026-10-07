@@ -21,29 +21,32 @@ public sealed class UiAutomationService : IUiAutomationService
         var root = GetRootElement(windowHandle);
         var truncated = false;
 
-        // Bound traversal before materializing the result so a pathological UI
-        // tree cannot exhaust the MCP response budget.
-        IEnumerable<UiElementInfo> flattened = Flatten(root, windowHandle, depth, () => truncated = true)
-            .Take(MaxTreeElements + 1);
+        // Bound traversal before filtering so a pathological UI tree cannot
+        // exhaust the response budget. Preserve an explicit truncation signal
+        // even when later filters discard some of the bounded elements.
+        var bounded = Flatten(root, windowHandle, depth, () => truncated = true)
+            .Take(MaxTreeElements + 1)
+            .ToArray();
 
+        if (bounded.Length > MaxTreeElements)
+        {
+            truncated = true;
+            bounded = bounded[..MaxTreeElements];
+        }
+
+        IEnumerable<UiElementInfo> filtered = bounded;
         if (controlTypes is { Count: > 0 })
         {
             var wanted = new HashSet<string>(controlTypes, StringComparer.OrdinalIgnoreCase);
-            flattened = flattened.Where(element => wanted.Contains(element.ControlType));
+            filtered = filtered.Where(element => wanted.Contains(element.ControlType));
         }
 
         if (interactableOnly)
         {
-            flattened = flattened.Where(IsInteractable);
+            filtered = filtered.Where(IsInteractable);
         }
 
-        var materialized = flattened.ToArray();
-        if (materialized.Length > MaxTreeElements)
-        {
-            truncated = true;
-            materialized = materialized[..MaxTreeElements];
-        }
-
+        var materialized = filtered.ToArray();
         return new UiTreeResult(materialized, truncated, depth, materialized.Length);
     }
 
@@ -152,10 +155,21 @@ public sealed class UiAutomationService : IUiAutomationService
             throw new ArgumentException($"Unknown or expired UI element reference: {elementRef}");
         }
 
-        if (cached.RootWindowHandle != 0 && !IsWindow(new IntPtr(cached.RootWindowHandle)))
+        if (cached.RootWindowHandle != 0)
         {
-            elements.TryRemove(elementRef, out _);
-            throw new InvalidOperationException("UI element root window is no longer valid.");
+            var root = new IntPtr(cached.RootWindowHandle);
+            if (!IsWindow(root))
+            {
+                elements.TryRemove(elementRef, out _);
+                throw new InvalidOperationException("UI element root window is no longer valid.");
+            }
+
+            _ = GetWindowThreadProcessId(root, out var currentRootProcessId);
+            if (currentRootProcessId != 0 && currentRootProcessId != cached.ProcessId)
+            {
+                elements.TryRemove(elementRef, out _);
+                throw new InvalidOperationException("UI element root window identity changed; reacquire it before acting.");
+            }
         }
 
         try
@@ -314,6 +328,9 @@ public sealed class UiAutomationService : IUiAutomationService
 
     [DllImport("user32.dll")]
     private static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
 
     private sealed record CachedElement(AutomationElement Element, long RootWindowHandle, int ProcessId, DateTimeOffset CreatedUtc);
 
