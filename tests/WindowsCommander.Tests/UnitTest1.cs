@@ -16,6 +16,8 @@ public class RiskPolicyServiceTests
     [InlineData("copy_move_delete_path", RiskLevel.High, true)]
     [InlineData("set_environment_variable", RiskLevel.High, true)]
     [InlineData("execute_powershell", RiskLevel.High, true)]
+    [InlineData("start_process_operation", RiskLevel.High, true)]
+    [InlineData("cancel_process_operation", RiskLevel.High, true)]
     public void Classify_ReturnsExpectedRisk(string toolName, RiskLevel expectedRisk, bool expectedConfirmation)
     {
         var service = new RiskPolicyService();
