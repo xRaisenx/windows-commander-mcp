@@ -19,7 +19,7 @@ its language server, its router, or its coordinator is degraded or unavailable.
    when Serena, NMBV Bot, its router, coordinator, language servers, checkpoint
    state, or task ledger are completely unavailable.
 2. **Small failure domain.** A failure in optional CodeIntel, search acceleration,
-   the terminal UI, or Serena integration must not terminate the core MCP server.
+   the terminal observer, or Serena integration must not terminate the core MCP server.
 3. **Deterministic before intelligent.** Recovery decisions are rule-based,
    observable, bounded, and testable. The rescue MCP does not contain a second
    LLM agent.
@@ -234,13 +234,21 @@ compatibility tool surface may expose it.
 
 There must not be two independent task engines.
 
-### 4. Live Rescue terminal view
+### 4. Live Rescue terminal observer
 
-A single terminal UI presents structured supervisor state.
+A single terminal observer presents structured supervisor state.
 
-The initial implementation should use **one** .NET terminal rendering approach,
-preferably Spectre.Console for a non-interactive live dashboard. Do not add
-Terminal.Gui, OpenTelemetry, Aspire, and Spectre simultaneously.
+The observer **must not render through the MCP server stdout stream**. Stdio
+stdout is the JSON-RPC transport and must contain protocol messages only. The
+observer therefore runs out-of-process, or consumes a dedicated side channel
+such as a bounded local event file/named pipe produced by the supervisor.
+Observer failure, terminal rendering failure, or ANSI incompatibility must have
+zero effect on MCP request execution.
+
+The initial implementation should use **one** .NET rendering approach,
+preferably Spectre.Console in the observer process. Do not add Terminal.Gui,
+OpenTelemetry, Aspire, and Spectre simultaneously. When terminal capabilities
+are inadequate, the observer falls back to plain line-oriented rendering.
 
 When output is redirected or terminal capabilities are inadequate, fall back to
 plain line-oriented structured logging.
@@ -276,9 +284,11 @@ Color contract:
 The terminal view is observational. It does not contain a second scheduler or
 decision engine.
 
-### 5. Optional isolated Rescue CodeIntel sidecar
+### 5. Isolated Rescue CodeIntel sidecar (optional at runtime, required capability)
 
-CodeIntel is loaded only when semantic source repair is required.
+CodeIntel is loaded only when semantic source repair is required. It is optional
+at runtime so the core rescue MCP can boot without it, but the packaged Rescue v2
+release must include and validate the capability.
 
 It must run outside the core MCP process and may be restarted or disabled
 without affecting Windows Commander.
@@ -290,9 +300,14 @@ Initial Rescue CodeIntel scope is deliberately small:
 - find references
 - file diagnostics
 - symbol diagnostics
-- symbol-body replacement or workspace edit
-- rename symbol
-- safe-delete preflight
+- single-file symbol-body replacement/insertion using the language server only
+  to resolve the target, followed by the core atomic/CAS filesystem contract;
+- safe-delete **preflight** that proves references are absent but does not
+  perform an unjournaled cross-file mutation.
+
+Cross-file semantic rename is not part of the initial rescue scope. It may be
+added only after an all-or-none multi-file mutation journal, crash recovery,
+version preconditions, and rollback tests exist.
 
 The implementation may use SolidLSP or direct language-server adapters, but the
 core contract is language-server semantics rather than Serena process reuse.
@@ -500,39 +515,544 @@ Preferred implementation path:
 A protocol migration must not be bundled with unrelated service rewrites unless
 tests prove the boundary first.
 
+## Second-pass adversarial hardening requirements
+
+These requirements close failure modes discovered during the post-spec red-team
+pass. They are mandatory because they protect speed, accuracy, and quality at
+the same time rather than trading one for another.
+
+### Stdio purity, framing, and response serialization
+
+- MCP stdout is protocol-only. Diagnostics, TUI rendering, progress text, and
+  debug logging must never write to stdout.
+- Concurrent request execution still uses exactly one serialized response
+  writer so JSON-RPC frames cannot interleave.
+- Incoming newline-delimited request frames have a configurable hard byte
+  limit before JSON deserialization. Oversized requests are rejected without
+  materializing unbounded strings.
+- The response queue is bounded. A slow or disconnected reader may apply
+  backpressure but may not create unbounded memory growth.
+- EOF/client disconnect cancels or detaches in-flight operations according to
+  their declared lifetime and releases all transport-owned resources.
+
+### Monotonic timing and truthful stall detection
+
+Elapsed time, deadlines, queue wait time, and stall windows use
+`Stopwatch`/monotonic time. UTC wall-clock time is used only for human/audit
+timestamps. System clock adjustments must not make an operation appear to run
+backward, exceed a false deadline, or escape a deadline.
+
+A fixed sleep is not considered evidence of progress. In particular, the
+current fixed 150 ms capture-settle delay must be benchmarked against a
+compositor-aware wait such as `DwmFlush` or another bounded condition-based
+mechanism. The faster mechanism is selected only if capture correctness remains
+equal or better.
+
+### Replay, idempotency, and duplicate delivery
+
+Mutating operations support an optional caller operation/idempotency key.
+A duplicate key with identical normalized arguments returns the already-known
+result/status rather than performing the mutation twice. Reuse of the same key
+with different normalized arguments is rejected.
+
+This protects against reconnect/retry ambiguity without making every read
+operation stateful.
+
+### Process containment and identity
+
+Owned non-detached process trees should use Windows Job Objects where compatible
+so cancellation and server teardown can reliably contain descendants. Job
+Object integration must detect an already-jobbed process and fall back safely
+rather than assuming assignment always succeeds.
+
+Process identity is not PID alone. Any self-protection, ownership, or destructive
+process decision that could be affected by PID reuse uses available identity
+evidence such as PID + creation time + executable path. Stale identities fail
+closed.
+
+The current `ProcessService.ListProcesses` implementation must also close a
+handle-lifetime defect: process objects filtered out before `ToSummary` are not
+disposed. Enumeration must dispose every `Process` instance regardless of
+filter outcome and isolate races with processes that exit during inspection.
+
+### Window identity and Win32 return-value correctness
+
+HWNDs are reusable. Cached or destructive UI/window actions must revalidate the
+window and relevant owning-process identity immediately before action rather
+than assuming a previously observed HWND still identifies the same object.
+
+The current `SetWindowState` implementation must not treat the return value of
+`ShowWindow` as operation success. The Win32 contract reports whether the
+window **was previously visible**, not whether the requested state transition
+succeeded. Completion must be verified from observable window state.
+
+### Hierarchical resource locking
+
+Path locking cannot be exact-string-only. Conflicts include ancestor/descendant
+relationships after canonicalization, for example:
+
+- `D:\a`
+- `D:\a\b.txt`
+
+Lock acquisition therefore uses a deterministic canonical hierarchy and a
+single global ordering rule. Multi-resource operations acquire all required
+locks in sorted canonical order, never upgrade a held lock, and support
+cancellation while waiting. This prevents both parent/child races and lock-order
+deadlocks.
+
+### Filesystem TOCTOU and metadata preservation
+
+A guarded write revalidates target identity **after acquiring the resource
+lock** and again immediately before the replace/commit boundary when reparse
+state could have changed.
+
+Atomic replacement of an existing file must define and test preservation
+semantics for:
+
+- ACL/security descriptor where applicable;
+- timestamps that should or should not change;
+- file attributes;
+- encoding/BOM and newline convention for text-preserving edit paths.
+
+No symbolic repair may silently normalize encoding or line endings.
+
+### Search semantic parity
+
+The ripgrep accelerator and native fallback must implement the same documented
+search semantics for:
+
+- hidden files;
+- ignored files;
+- binary files;
+- case sensitivity;
+- glob inclusion/exclusion;
+- encoding limitations;
+- maximum results.
+
+If exact parity cannot be provided for an input, the response explicitly states
+the engine limitation instead of silently returning a different meaning.
+
+### Audit durability policy
+
+Audit failure behavior is risk-based:
+
+- read-only inspection may continue with an explicit `audit_degraded=true`
+  state;
+- a high-risk mutation must not silently claim durable completion when its
+  required audit record cannot be persisted;
+- any override that permits a high-risk mutation during audit degradation must
+  be explicit, narrow, surfaced in the result, and itself recorded when
+  persistence becomes available.
+
+The persisted audit is always redacted. Raw secret-bearing command/content
+arguments are not recoverable from the durable audit file. The public history
+contract must not imply that sensitive arguments survive restart.
+
+### Queue admission, fairness, and overload
+
+The scheduler has a bounded admission queue and a defined overload response.
+A flood of ordinary work cannot consume the reserved rescue capacity forever,
+and rescue traffic cannot starve all normal work indefinitely. Fairness is
+measured and tested rather than implemented as unlimited priority.
+
+Queue wait time is included separately from execution time in every operation
+record.
+
+### Interactive-session and privilege awareness
+
+Desktop/UI operations report and validate the Windows session they are targeting.
+Before keyboard/mouse/UIA/capture operations, the server can distinguish at
+least:
+
+- interactive desktop available;
+- workstation/session unavailable or locked where detectable;
+- current process session id;
+- current elevation/integrity capability relevant to the requested operation.
+
+The server must fail fast with evidence instead of hanging against an unavailable
+interactive desktop.
+
+### Explicit unattended policy
+
+Unattended behavior is a declared runtime policy, not an accidental property of
+whichever CMD happened to launch the current managed runtime.
+
+Runtime status exposes the effective confirmation policy. The managed launcher
+ensures the configured policy reaches the actual MCP child. Self-protection,
+CAS, bounded execution, and rollback rules remain active in unattended mode.
+
+### Singleton defense in depth
+
+Managed runtime ownership remains the primary singleton mechanism, but the MCP
+process additionally supports a production instance key/mutex so an accidental
+second raw owner for the same configured instance fails quickly with a clear
+diagnostic instead of creating split-brain service.
+
+Test/staging instances use distinct explicit instance keys.
+
+### Build identity and provenance
+
+The running server exposes a machine-readable build identity containing:
+
+- product version;
+- source commit;
+- build timestamp if reproducibly available;
+- executable SHA-256;
+- instance key;
+- configuration generation/version.
+
+Do not discard Git commit/build metadata merely to produce a short SemVer
+display string. Human version and provenance are separate fields.
+
+Deployment remains side-by-side/versioned. A new build is probed before it
+becomes authoritative; failure leaves or restores the last-known-good target.
+
+### CodeIntel isolation and workspace versioning
+
+The optional CodeIntel sidecar communicates only over a local, user-scoped
+transport such as inherited stdio or a named pipe with current-user ACLs. It
+does not open a broadly reachable TCP listener by default.
+
+Every semantic result is bound to an explicit workspace root and document
+version/generation. A semantic mutation is rejected if the underlying document
+version/hash changed after symbol resolution.
+
+Unsupported languages report `unsupported`; they do not silently fall back to
+regex while claiming symbolic semantics.
+
+## Third-pass accuracy, security-boundary, and Windows-behavior findings
+
+### Child-process environment minimization
+
+The current live Windows Commander child was observed to inherit credential-like
+environment variable names from its parent process, including the control-plane
+credential reference environment and unrelated API-key variables. The MCP child
+does not need those secrets to perform Windows operations.
+
+The managed runtime must therefore launch Windows Commander with a minimal
+allowlisted environment containing only operating-system/runtime variables and
+explicit Windows Commander configuration needed by the child. Control-plane
+credentials required by tunnel-client stay in the tunnel process and are not
+copied into the MCP child unless a documented capability requires them.
+
+The allowlist must preserve required Windows runtime behavior such as SystemRoot,
+PATH where required, TEMP/TMP, USERPROFILE, and explicit .NET/application
+settings, while excluding unrelated credential-bearing variables by default.
+
+### Strict tool input contracts
+
+Tool JSON Schemas must reject unknown properties where compatibility permits and
+declare server-enforced ranges for bounded integers such as timeouts, result
+counts, repeat counts, dimensions, depths, and payload sizes.
+
+Server-side validation remains authoritative even when the client ignores JSON
+Schema. A typo in an argument must not silently become a default behavior when
+that could change the target or scope of an operation.
+
+JSON-RPC lifecycle validation must also cover the `jsonrpc` version field,
+initialize state, malformed request structure, notification behavior, and the
+correct protocol error class rather than mapping all structural errors to an
+internal error.
+
+### Clipboard and text-input correctness
+
+Clipboard access and clipboard-backed typing run on the exclusive desktop STA
+lane and have bounded waits/cancellation. An STA helper may not call unbounded
+`Thread.Join()`.
+
+`type_text` currently advertises `speed_ms` but the implementation pastes the
+entire string and ignores that argument. Rescue v2 must either remove the
+argument from the contract or implement documented semantics; it may not keep a
+parameter that has no effect.
+
+The current fixed 400 ms clipboard-restore delay is a latency tax and a race
+heuristic. It must be measured and replaced with a bounded, more deterministic
+mechanism where one is demonstrably reliable; otherwise the limitation is
+documented and isolated from non-text desktop operations.
+
+Input-sequence execution with `abort_on_error=false` must retain per-step failure
+evidence instead of swallowing exceptions and returning only a reduced completed
+count.
+
+Horizontal scrolling must use the Windows horizontal-wheel event rather than the
+vertical-wheel event with a reversed delta. The current implementation uses
+`MOUSEEVENTF_WHEEL` for left/right and therefore does not implement the declared
+horizontal action correctly.
+
+### No fabricated measurements or confidence
+
+Unknown system/display/vision values are represented as unknown/null, not as
+plausible constants.
+
+Current examples that must be corrected include:
+
+- system integrity level reported as the literal string `Unknown` without an
+  explicit unknown-data contract;
+- display DPI scale hardcoded to 1.0;
+- refresh rate/color depth/adapter information returned as zero/empty defaults;
+- OCR line confidence returned as 1.0 even though Windows OCR does not expose
+  per-line confidence;
+- visual window candidates assigned a hardcoded 0.80 confidence.
+
+Accuracy takes precedence over filling every field. A missing measurement is
+better than fabricated certainty.
+
+### Windows service/process handle hygiene
+
+Every disposable `Process` and `ServiceController` created during enumeration is
+disposed regardless of filter outcome, early exit, or per-item failure.
+Enumeration isolates transient races where a process/service disappears while
+being inspected instead of failing the entire listing.
+
+### Registry and clipboard result bounds
+
+Registry reads and clipboard reads are subject to explicit result budgets before
+large values are materialized into an MCP response. Registry enumeration has a
+maximum result count; large binary/string values report bounded metadata or a
+bounded representation instead of forcing full allocation followed by a late
+response-size rejection.
+
+### Notification and action completion semantics
+
+Result fields use precise semantics such as `requested`, `started`, `observed`,
+or `verified` rather than returning `Delivered=true`/`Completed=true` when the
+underlying Windows API only proves that a request was issued.
+
+The current notification implementation disposes its `NotifyIcon` immediately
+after requesting a balloon notification and cannot truthfully prove delivery.
+Likewise, window/process/shell actions must not claim stronger completion than
+the observable evidence supports.
+
+### Avoid process-global Windows setting mutations
+
+Window-focus recovery must not depend on temporarily changing machine/session
+global foreground-lock configuration when a process crash could prevent
+restoration. Prefer APIs and thread-input coordination whose failure scope stays
+inside the Windows Commander process. Any unavoidable global mutation requires
+an explicit opt-in and a crash-recovery story.
+
+### Audit redaction precision
+
+Durable audit remains secret-safe, but redaction must not destroy unrelated
+diagnostic context merely because an argument name contains a broad substring
+such as `key`. Redaction policy is tested with positive secret cases and
+negative non-secret cases such as registry key paths and keyboard keys.
+
+### Response-data and observer isolation
+
+The terminal observer consumes a versioned, bounded event schema from a
+side-channel source. It never scrapes human-formatted MCP stderr logs as its
+source of truth and never shares mutable scheduler state with the MCP process.
+
+Observer restarts, slow rendering, terminal resizing, and log rotation must not
+block MCP request execution or cause event production to grow without bound.
+## Fourth-pass hot-path, transport, and desktop-integrity findings
+
+### Actual transport-frame budgeting
+
+Result-size enforcement must apply to the final serialized JSON-RPC frame, not
+only to the inner tool-result text. The current server serializes many result
+objects to JSON text and then serializes that JSON again as an MCP text-content
+string, so escaping can make the actual wire frame materially larger than the
+pre-check.
+
+Rescue v2 must either:
+
+- use structured content where negotiated and compatible; or
+- reserve/measure the final JSON-RPC serialization overhead before enqueueing
+  the response.
+
+Image/base64 content is also subject to a final serialized-frame budget.
+
+### Tunnel compatibility gate for out-of-order completion
+
+Concurrent execution is enabled through the real tunnel only after an integration
+test proves that tunnel-client and the consuming MCP client correctly correlate
+responses by JSON-RPC id when requests complete out of submission order.
+
+If that compatibility test fails, Rescue v2 does **not** fake concurrency by
+writing unordered responses into an incompatible transport. Long work instead
+returns a quick durable operation/task handle so the stdio protocol path remains
+responsive while transport responses stay compatible.
+
+### Cached immutable tool registry
+
+Tool descriptors, schemas, execution class, risk, timeout, and output policy are
+constructed once into an immutable registry and reused by `tools/list` and
+dispatch. This removes repeated allocation and also prevents schema/risk/dispatch
+metadata from drifting across separate tables.
+
+### Read truncation must be explicit
+
+A bounded `read_file` response must include enough metadata to distinguish a
+complete read from a prefix. At minimum it reports total size when known, bytes
+returned, and `truncated`. Text reads must not end in a silently corrupted
+partial multibyte character; truncation is aligned to a valid decoding boundary
+or returned as bytes/base64 when that cannot be guaranteed.
+
+### Large copy/delete progress and cancellation
+
+Cancellation between directory entries is insufficient for one multi-gigabyte
+file. Large file copy uses chunked/cancellable I/O with bytes-progress reporting.
+Recursive delete uses explicit bounded enumeration when cancellation semantics
+are promised instead of delegating an entire huge tree to one uninterruptible
+`Directory.Delete(..., recursive:true)` call.
+
+### Clipboard race protection
+
+Clipboard-backed typing must not restore an old clipboard snapshot over content
+the user or another application copied after Windows Commander began its paste.
+Where supported, use the Windows clipboard sequence number (or equivalent
+identity evidence) to restore only if the clipboard still matches the
+automation-owned generation. A concurrent user clipboard change wins.
+
+### Desktop-side-effect hot path
+
+Courtesy UI/audio indicators are outside the correctness path. They may not add
+multi-second startup waits or synchronously block a tool on a WPF dispatcher.
+The current overlay creation path can wait up to five seconds for its UI thread
+and uses synchronous dispatcher invocation. Rescue v2 prewarms or posts indicator
+work asynchronously with a strict bounded budget; on failure it drops the
+indicator event rather than delaying the requested operation.
+
+The local confirmation UI uses one managed STA dispatcher. A timed-out
+confirmation must close/cancel its own dialog; it may not leave an orphaned
+`MessageBox` thread after the MCP request has already returned.
+
+### Poisoned-lane containment for non-cancellable Windows APIs
+
+Some in-process Windows/COM/UI Automation calls cannot be force-cancelled safely.
+If one exceeds its hard deadline despite cancellation, the affected desktop/UI
+lane is marked `POISONED` and circuit-broken. Rescue v2 does not spawn unlimited
+replacement threads around an indefinitely blocked COM call.
+
+Core filesystem/process/status/rescue lanes remain available. Recovery may
+restart the MCP process if restoring the poisoned desktop lane is required.
+
+### UI Automation reference identity
+
+An element reference is not trusted solely because its UI Automation runtime id
+matches an earlier observation. Cached references carry generation, root HWND,
+owning process identity, and expiry. Actions revalidate these before invocation
+so runtime-id/HWND reuse cannot redirect an action to a different control.
+
+### Window/text metadata completeness
+
+Window-title retrieval must not silently truncate to a fixed 512-character
+buffer when the Win32 API can report the required length. Any intentional
+truncation is surfaced in metadata.
+
+### Active-window capture must not silently broaden
+
+If an `active_window` capture cannot resolve an actual foreground window, the
+tool must return an explicit error/fallback result. It must not silently capture
+the full desktop, which changes both privacy scope and semantic meaning.
+
+### Environment and spawned-child inheritance
+
+After the MCP process itself is launched with a minimal environment, child
+process execution inherits only that scrubbed baseline plus caller-provided
+explicit overrides. Secret-bearing parent/tunnel variables must not reappear
+through an execution-service shortcut.
+
+### Sensitive direct-read policy
+
+Direct environment-variable reads whose names match configured secret classes
+(password/token/secret/private credential patterns) are not returned accidentally
+as ordinary low-risk inspection. The tool either reports redacted/present state
+or requires an explicit sensitive-read authorization path. General shell
+execution remains a separately classified high-authority capability.
+
+### Registry raw-value semantics
+
+Registry reads document whether expandable strings are returned raw or expanded,
+and provide an explicit way to address the default unnamed value. Enumeration
+does not silently change semantics based on value type.
+
+### Control-plane startup configuration schema
+
+`runtime.json` and the generated tunnel profile have a versioned schema.
+Startup rejects malformed/unknown critical fields, missing target binaries,
+unexpected tunnel ids, and configuration generations that do not match the
+intended release. Secrets remain references, not serialized plaintext.
+
+### Side-by-side deployment and rollback proof
+
+A deployment never overwrites/renames the currently executing published folder.
+It publishes a new immutable version directory, verifies its manifest/hash,
+starts/probes it under managed ownership, then changes authority. Failed probes
+leave the last-known-good build runnable and produce one bounded rollback path.
 ## Test strategy
 
 ### Deterministic unit/contract suite
 
 Must cover:
 
-- protocol version negotiation
+- protocol version negotiation and initialize-state enforcement
+- malformed/invalid JSON-RPC request classification
 - request error isolation
+- stdout protocol purity and single response-writer serialization
+- request-frame byte limit and bounded response queue
+- disconnect/EOF cleanup
+- strict unknown-argument rejection and numeric range validation
 - response-size limits
-- scheduler global limits
+- scheduler global limits, admission bounds, fairness, and overload
 - exclusive desktop lane
-- keyed mutation locking
-- real PID preservation
+- hierarchical keyed mutation locking and deterministic lock ordering
+- monotonic deadline/stall timing under wall-clock change
+- idempotent duplicate mutation replay
+- real PID preservation and PID-reuse identity rejection
+- process/service object disposal under filters and transient exits
+- Job Object process-tree containment plus safe fallback
 - timeout partial output
 - cancellation/process-tree termination
 - process termination verification
+- `ShowWindow` result semantics and verified window-state completion
+- HWND reuse/revalidation
 - bounded file reads
-- atomic writes
-- stale-read/CAS rejection
+- atomic writes and metadata/encoding/newline preservation
+- stale-read/CAS rejection including post-lock revalidation
 - recursive cancellation
 - reparse-point policy
 - recycle contract
-- search pagination
+- search pagination and accelerator/fallback semantic parity
 - native search fallback
+- clipboard STA timeout/cancellation and bounded reads
+- `type_text` contract consistency
+- horizontal-wheel correctness
+- per-step input-sequence error evidence
 - UI tree bounds
 - UI cache eviction
 - image/OCR dimension limits
-- audit persistence/redaction
+- unknown display/system values represented without fabricated certainty
+- OCR/visual confidence truthfulness
+- registry result bounds
+- notification/action evidence-level semantics
+- audit persistence, degradation policy, and precise redaction
+- MCP child environment allowlist/no control-plane secret inheritance
+- unattended-policy propagation
 - self-protection
 - recovery retry budget
 - recovery circuit breaker
-- runtime owner reconciliation
+- runtime owner reconciliation and production instance mutex
 - wrong-target runtime detection
+- build provenance/source-SHA reporting
+- observer side-channel isolation and bounded event production
+- final serialized JSON-RPC frame budgeting including escaping/base64 overhead
+- tunnel-client out-of-order response correlation compatibility
+- immutable cached tool-registry/schema consistency
+- bounded read `truncated`/total-size semantics and multibyte boundary handling
+- large-file copy progress/cancellation and recursive-delete cancellation
+- clipboard sequence/race-safe restore
+- nonblocking indicator hot path and timed-out confirmation cleanup
+- poisoned desktop-lane containment for non-cancellable APIs
+- UIA generation/root/process reference revalidation
+- active-window capture failure without full-desktop scope broadening
+- scrubbed environment propagation to spawned child processes
+- sensitive direct environment-read policy
+- registry raw/default-value semantics
+- versioned runtime/profile configuration validation
+- side-by-side deployment manifest/hash and last-known-good rollback
 
 ### Integration tests
 
@@ -554,7 +1074,11 @@ must not turn an environment prerequisite into a false product regression.
 
 Performance work is evidence-driven.
 
-Required benchmarks compare the new build against `71daff5` for:
+Required benchmarks compare the new build against `71daff5`. Benchmark runs
+use at least 5 warm-up iterations followed by at least 30 measured iterations
+for short operations, reporting median and p95 rather than one-off best cases.
+
+Required benchmarks include:
 
 - cold initialize
 - warm `tools/list`
@@ -564,14 +1088,48 @@ Required benchmarks compare the new build against `71daff5` for:
 - concurrent slow + fast request
 - audit-heavy small operations
 
-Mandatory behavioral target:
+Mandatory behavioral targets:
 
-A slow process operation must not head-of-line block an unrelated fast read or
-status operation for the full duration of the slow request.
+- A slow process operation must not head-of-line block an unrelated fast read or
+  status operation for the full duration of the slow request.
+- During a synthetic >=1 second slow operation, an unrelated fast status/read
+  request completes within the greater of 250 ms or 2x that operation's isolated
+  p95 on the same machine.
+- Small-read, bounded-listing, and warm `tools/list` hot paths use a
+  non-inferiority budget: median may not be slower than the `71daff5` baseline
+  by more than the greater of 2 ms or 5%, and p95 may not be slower by more
+  than the greater of 10 ms or 10%.
+- A result outside that margin blocks release until the regression is removed
+  or repeated benchmarking proves the baseline/noise model was invalid. A
+  correctness or safety feature is not silently purchased with hot-path latency;
+  its checks must be moved off the hot path, cached, amortized, or otherwise
+  engineered so the user-visible speed contract remains intact.
+- A 10,000-operation lightweight stress run must show no monotonic unbounded
+  managed-memory, handle, operation-record, UI-element-cache, or queue growth.
+- Dashboard/observer absence and presence must not materially change MCP hot-path
+  correctness; observer work is outside the protocol execution path.
 
-No benchmark target justifies weakening validation, output bounds, locking, or
-failure isolation.
+No benchmark target justifies weakening validation, output bounds, locking,
+audit policy, or failure isolation. A speed optimization that changes semantics
+or hides evidence is rejected even if it benchmarks faster.
 
+## Severity rubric
+
+The defect register uses these release-blocking definitions:
+
+- **P0:** data loss/corruption, uncontrolled destructive action, security boundary
+  failure, or loss of the rescue control plane.
+- **P1:** false success on a material operation, wrong-target action, repeatable
+  deadlock/livelock/crash loop, or inability to recover a supported primary
+  failure mode.
+- **P2:** reproducible correctness defect, resource leak/growth, contract
+  mismatch, cancellation failure, or performance regression beyond this spec's
+  accepted thresholds.
+- **P3/P4:** lower-impact usability, diagnostics, or cosmetic defects that do
+  not invalidate the defined rescue contract.
+
+Every discovered P0/P1/P2 item must have an owner, reproduction, fix or scope
+decision, and regression evidence before release.
 ## Definition of Done
 
 Rescue v2 is complete only when:
@@ -606,7 +1164,10 @@ To prevent Rescue v2 from becoming another overbuilt control plane:
 - no PowerShell RunspacePool without benchmark evidence;
 - no ten unrestricted generic workers;
 - no unrestricted REPL;
+- no unjournaled cross-file semantic rename in the initial CodeIntel scope;
 - no automatic broad repository refactoring;
+- no unbounded STA thread joins, unbounded request frames, or unbounded observer queues;
+- no fabricated confidence/metrics values when the platform does not provide them;
 - no claim that all possible future defects have been eliminated.
 
 ## Implementation sequencing
