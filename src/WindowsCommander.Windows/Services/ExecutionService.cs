@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Services;
-using WindowsCommander.McpServer.Mcp;
 
 namespace WindowsCommander.Windows.Services;
 
@@ -158,7 +157,7 @@ public sealed class ExecutionService : IExecutionService
             startInfo.WorkingDirectory = workingDirectory;
         }
 
-        _ = EnvironmentSanitizer.ApplyTo(startInfo);
+        _ = ChildEnvironmentSanitizer.ApplyTo(startInfo);
 
         if (environment is not null)
         {
