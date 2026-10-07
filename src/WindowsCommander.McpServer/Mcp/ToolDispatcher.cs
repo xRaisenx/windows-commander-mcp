@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Safety;
@@ -25,6 +26,11 @@ public sealed class ToolDispatcher
     private readonly IControlIndicatorService controlIndicatorService;
     private readonly IAuditLog auditLog;
     private readonly IRiskPolicyService riskPolicy;
+    private readonly TimeSpan toolCallTimeout;
+    private readonly int maxResponseBytes;
+    private const int DefaultMaxResponseBytes = 4 * 1024 * 1024;
+    private static readonly TimeSpan DefaultToolCallTimeout = TimeSpan.FromSeconds(90);
+
     // When true, high-risk tools are gated behind a local confirmation dialog.
     // Disabled (unattended mode) for automated harness/CI runs.
     private readonly bool requireConfirmation;
@@ -66,7 +72,9 @@ public sealed class ToolDispatcher
         IControlIndicatorService controlIndicatorService,
         IAuditLog auditLog,
         IRiskPolicyService riskPolicy,
-        bool requireConfirmation)
+        bool requireConfirmation,
+        TimeSpan? toolCallTimeout = null,
+        int maxResponseBytes = DefaultMaxResponseBytes)
     {
         this.processService = processService;
         this.windowService = windowService;
@@ -87,6 +95,11 @@ public sealed class ToolDispatcher
         this.auditLog = auditLog;
         this.riskPolicy = riskPolicy;
         this.requireConfirmation = requireConfirmation;
+
+        var configuredTimeout = toolCallTimeout ?? DefaultToolCallTimeout;
+        this.toolCallTimeout = TimeSpan.FromMilliseconds(
+            Math.Clamp(configuredTimeout.TotalMilliseconds, 100, 110_000));
+        this.maxResponseBytes = Math.Clamp(maxResponseBytes, 64, 16 * 1024 * 1024);
     }
 
     public object ListTools()
@@ -241,7 +254,8 @@ public sealed class ToolDispatcher
                     Str("path", "Directory path to list.", required: true),
                     Bool("recursive", "Recurse into subdirectories when true."),
                     Bool("include_hidden", "Include hidden and system entries when true."),
-                    Str("pattern", "Optional wildcard filename pattern, e.g. *.txt.")),
+                    Str("pattern", "Optional wildcard filename pattern, e.g. *.txt."),
+                    Int("max_results", "Maximum number of entries to return (default 1000, max 5000).")),
                 Tool("read_file", "Reads text or binary file content with encoding detection.",
                     Str("path", "File path to read.", required: true),
                     Str("encoding", "Text encoding name, e.g. utf-8, utf-16, ascii."),
@@ -327,40 +341,119 @@ public sealed class ToolDispatcher
         var operationId = Guid.NewGuid().ToString("N");
         var args = ToDictionary(arguments);
         var risk = riskPolicy.Classify(name, args);
-
-        // High-risk tools (process kills, file writes/deletes, env and script
-        // execution) are gated behind a local confirmation dialog. The
-        // request_user_confirmation tool is the dialog itself, so gating it
-        // would be circular; it is always exempt.
-        if (requireConfirmation
-            && name != "request_user_confirmation"
-            && riskPolicy.RequiresConfirmation(name, args))
-        {
-            var confirmation = controlIndicatorService.RequestUserConfirmation(
-                "windows-commander — confirm high-risk action",
-                $"Allow the '{name}' tool to run on this machine?",
-                risk.ToString(),
-                null);
-
-            if (confirmation.Decision != "approved")
-            {
-                auditLog.Record(new AuditEntry(operationId, name, startedAt, DateTimeOffset.UtcNow, $"blocked:{confirmation.Decision}", args, "High-risk action was not approved by the local user.", risk));
-                return ToErrorResult($"Blocked: '{name}' is a high-risk action and the local user did not approve it ({confirmation.Decision}).");
-            }
-        }
-
-        if (ComputerUseTools.Contains(name))
-        {
-            notifier.Notify();
-            controlIndicatorService.SignalActivity(DescribeActivity(name), risk == RiskLevel.High, ResolveGlowBounds(name, arguments));
-        }
+        CancellationTokenSource? operationSource = null;
+        Task<object>? dispatchTask = null;
 
         try
         {
-            var result = await DispatchAsync(name, arguments, cancellationToken);
-            auditLog.Record(new AuditEntry(operationId, name, startedAt, DateTimeOffset.UtcNow, "success", args, null, risk));
+            // High-risk tools (process kills, file writes/deletes, env and script
+            // execution) are gated behind a local confirmation dialog. The
+            // request_user_confirmation tool is the dialog itself, so gating it
+            // would be circular; it is always exempt.
+            if (requireConfirmation
+                && name != "request_user_confirmation"
+                && riskPolicy.RequiresConfirmation(name, args))
+            {
+                var confirmationBudget = GetRemainingBudget(startedAt);
+                if (confirmationBudget <= TimeSpan.Zero)
+                {
+                    throw new TimeoutException("The tool call deadline elapsed before confirmation completed.");
+                }
 
-            return ToToolResult(result);
+                var confirmationTimeoutMs = (int)Math.Clamp(
+                    confirmationBudget.TotalMilliseconds,
+                    1000,
+                    30_000);
+
+                var confirmation = controlIndicatorService.RequestUserConfirmation(
+                    "windows-commander - confirm high-risk action",
+                    $"Allow the '{name}' tool to run on this machine?",
+                    risk.ToString(),
+                    confirmationTimeoutMs);
+
+                if (confirmation.Decision != "approved")
+                {
+                    auditLog.Record(new AuditEntry(
+                        operationId,
+                        name,
+                        startedAt,
+                        DateTimeOffset.UtcNow,
+                        $"blocked:{confirmation.Decision}",
+                        args,
+                        "High-risk action was not approved by the local user.",
+                        risk));
+                    return ToErrorResult(
+                        $"Blocked: '{name}' is a high-risk action and the local user did not approve it ({confirmation.Decision}).");
+                }
+            }
+
+            if (ComputerUseTools.Contains(name))
+            {
+                notifier.Notify();
+                controlIndicatorService.SignalActivity(
+                    DescribeActivity(name),
+                    risk == RiskLevel.High,
+                    ResolveGlowBounds(name, arguments));
+            }
+
+            var remainingBudget = GetRemainingBudget(startedAt);
+            if (remainingBudget <= TimeSpan.Zero)
+            {
+                throw new TimeoutException("The tool call deadline elapsed before dispatch started.");
+            }
+
+            operationSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            dispatchTask = Task.Run(
+                () => DispatchAsync(name, arguments, operationSource.Token),
+                CancellationToken.None);
+
+            var result = await dispatchTask.WaitAsync(remainingBudget, cancellationToken);
+            var toolResult = ToToolResult(result);
+
+            auditLog.Record(new AuditEntry(
+                operationId,
+                name,
+                startedAt,
+                DateTimeOffset.UtcNow,
+                "success",
+                args,
+                null,
+                risk));
+
+            return toolResult;
+        }
+        catch (TimeoutException exception) when (dispatchTask is null || !dispatchTask.IsCompleted)
+        {
+            operationSource?.Cancel();
+            var message =
+                $"Tool '{name}' exceeded the {toolCallTimeout.TotalSeconds:0.###}-second execution deadline.";
+            auditLog.Record(new AuditEntry(
+                operationId,
+                name,
+                startedAt,
+                DateTimeOffset.UtcNow,
+                "timeout",
+                args,
+                exception.Message,
+                risk));
+            return ToErrorResult(message);
+        }
+        catch (OperationCanceledException exception)
+        {
+            operationSource?.Cancel();
+            var message = cancellationToken.IsCancellationRequested
+                ? $"Tool '{name}' was cancelled."
+                : $"Tool '{name}' was cancelled before completion.";
+            auditLog.Record(new AuditEntry(
+                operationId,
+                name,
+                startedAt,
+                DateTimeOffset.UtcNow,
+                "cancelled",
+                args,
+                exception.Message,
+                risk));
+            return ToErrorResult(message);
         }
         catch (Exception exception)
         {
@@ -368,10 +461,48 @@ public sealed class ToolDispatcher
             // result as isError=true rather than as a JSON-RPC protocol error.
             // This keeps the connection healthy and lets the caller see and
             // recover from the error (e.g. a missing or invalid argument).
-            auditLog.Record(new AuditEntry(operationId, name, startedAt, DateTimeOffset.UtcNow, "error", args, exception.Message, risk));
+            auditLog.Record(new AuditEntry(
+                operationId,
+                name,
+                startedAt,
+                DateTimeOffset.UtcNow,
+                "error",
+                args,
+                exception.Message,
+                risk));
 
             return ToErrorResult($"Tool '{name}' failed: {exception.Message}");
         }
+        finally
+        {
+            if (operationSource is not null)
+            {
+                if (dispatchTask is null || dispatchTask.IsCompleted)
+                {
+                    _ = dispatchTask?.Exception;
+                    operationSource.Dispose();
+                }
+                else
+                {
+                    _ = dispatchTask.ContinueWith(
+                        static (task, state) =>
+                        {
+                            _ = task.Exception;
+                            ((CancellationTokenSource)state!).Dispose();
+                        },
+                        operationSource,
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
+            }
+        }
+    }
+
+    private TimeSpan GetRemainingBudget(DateTimeOffset startedAt)
+    {
+        var remaining = toolCallTimeout - (DateTimeOffset.UtcNow - startedAt);
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
     }
 
     // Builds the MCP isError result shape shared by tool failures and by
@@ -480,12 +611,17 @@ public sealed class ToolDispatcher
         await Task.Delay(CaptureForegroundSettleMs, cancellationToken);
     }
 
-    private static object ToToolResult(object result)
+    private object ToToolResult(object result)
     {
         // Screenshots are returned as MCP image content so clients can view the
         // PNG directly, instead of an unusable multi-megabyte base64 text blob.
         if (result is ScreenCaptureResult capture)
         {
+            var metadata = JsonSerializer.Serialize(
+                new { capture.Region, capture.MonitorId, capture.CapturedAt },
+                JsonOptions.Default);
+            EnsureResponseWithinBudget(capture.PngBase64, metadata);
+
             return new
             {
                 content = new object[]
@@ -499,13 +635,14 @@ public sealed class ToolDispatcher
                     new
                     {
                         type = "text",
-                        text = JsonSerializer.Serialize(
-                            new { capture.Region, capture.MonitorId, capture.CapturedAt },
-                            JsonOptions.Default)
+                        text = metadata
                     }
                 }
             };
         }
+
+        var text = JsonSerializer.Serialize(result, JsonOptions.Default);
+        EnsureResponseWithinBudget(text);
 
         return new
         {
@@ -514,10 +651,26 @@ public sealed class ToolDispatcher
                 new
                 {
                     type = "text",
-                    text = JsonSerializer.Serialize(result, JsonOptions.Default)
+                    text
                 }
             }
         };
+    }
+
+    private void EnsureResponseWithinBudget(params string[] payloads)
+    {
+        long bytes = 0;
+
+        foreach (var payload in payloads)
+        {
+            bytes += Encoding.UTF8.GetByteCount(payload);
+            if (bytes > maxResponseBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Tool result exceeded the configured response budget of {maxResponseBytes} bytes. " +
+                    "Narrow the request with max_results, max_bytes, max_dimension, or a more specific filter.");
+            }
+        }
     }
 
     private async Task<object> DispatchAsync(string name, JsonElement? arguments, CancellationToken cancellationToken)
@@ -769,7 +922,9 @@ public sealed class ToolDispatcher
                 GetRequiredString(arguments, "path"),
                 GetBool(arguments, "recursive") ?? false,
                 GetBool(arguments, "include_hidden") ?? false,
-                GetString(arguments, "pattern")),
+                GetString(arguments, "pattern"),
+                GetInt(arguments, "max_results"),
+                cancellationToken),
             "read_file" => await fileSystemService.ReadFileAsync(
                 GetRequiredString(arguments, "path"),
                 GetString(arguments, "encoding"),
@@ -801,7 +956,8 @@ public sealed class ToolDispatcher
                 GetString(arguments, "name_pattern"),
                 GetString(arguments, "content_query"),
                 GetBool(arguments, "include_hidden") ?? false,
-                GetInt(arguments, "max_results")),
+                GetInt(arguments, "max_results"),
+                cancellationToken),
             _ => throw new ArgumentException($"Unknown filesystem tool: {name}")
         };
     }
