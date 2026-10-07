@@ -1,19 +1,27 @@
+using System.Diagnostics;
+
 namespace WindowsCommander.McpServer.Mcp;
 
 internal static class EnvironmentSanitizer
 {
     private static readonly string[] SecretMarkers =
     {
-        "API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE_KEY"
+        "API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD",
+        "CREDENTIAL", "PRIVATE_KEY", "AUTHORIZATION", "CONNECTION_STRING"
     };
 
-    public static IReadOnlyList<string> ScrubCurrentProcess()
+    public static IReadOnlyList<string> ApplyTo(ProcessStartInfo startInfo)
     {
-        var removed = new List<string>();
-        foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables(EnvironmentVariableTarget.Process))
+        ArgumentNullException.ThrowIfNull(startInfo);
+        if (AllowChildSecrets())
         {
-            var name = entry.Key?.ToString();
-            if (string.IsNullOrWhiteSpace(name) || name.StartsWith("WINDOWS_COMMANDER_", StringComparison.OrdinalIgnoreCase))
+            return Array.Empty<string>();
+        }
+
+        var removed = new List<string>();
+        foreach (var name in startInfo.Environment.Keys.ToArray())
+        {
+            if (name.StartsWith("WINDOWS_COMMANDER_", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
@@ -23,10 +31,16 @@ internal static class EnvironmentSanitizer
                 continue;
             }
 
-            Environment.SetEnvironmentVariable(name, null, EnvironmentVariableTarget.Process);
+            startInfo.Environment.Remove(name);
             removed.Add(name);
         }
 
         return removed;
+    }
+
+    private static bool AllowChildSecrets()
+    {
+        var value = Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_ALLOW_CHILD_SECRETS");
+        return value is "1" or "true" or "TRUE" or "True" or "yes";
     }
 }
