@@ -3,8 +3,8 @@ param(
   [string]$EventLogPath = (Join-Path $env:LOCALAPPDATA 'WindowsCommander\activity.jsonl'),
   [ValidateRange(100,5000)]
   [int]$RefreshMs = 250,
-  [ValidateRange(8,60)]
-  [int]$MaxRows = 18,
+  [ValidateRange(6,40)]
+  [int]$MaxRows = 12,
   [switch]$Once
 )
 
@@ -67,44 +67,61 @@ function Write-Rule([int]$Width,[char]$Char='-',[ConsoleColor]$Color='DarkGray')
   Write-Host (' '+($Char.ToString()*[Math]::Max(20,$Width-2))) -ForegroundColor $Color
 }
 
+function Write-Detail([string]$Label,[string]$Value,[int]$Width,[ConsoleColor]$Color='Gray') {
+  if([string]::IsNullOrWhiteSpace($Value)){ return }
+  $prefix="   $Label "
+  $body=($Value -replace '[\r\n\t]+',' ').Trim()
+  $available=[Math]::Max(24,$Width-$prefix.Length-2)
+  $first=$true
+  while($body.Length -gt 0) {
+    $take=[Math]::Min($available,$body.Length)
+    if($take -lt $body.Length) {
+      $space=$body.LastIndexOf(' ',$take-1,$take)
+      if($space -gt [Math]::Floor($available*0.55)){ $take=$space }
+    }
+    $part=$body.Substring(0,$take).Trim()
+    if($first) {
+      Write-Host $prefix -ForegroundColor DarkGray -NoNewline
+      Write-Host $part -ForegroundColor $Color
+      $first=$false
+    } else {
+      Write-Host (' ' * $prefix.Length) -NoNewline
+      Write-Host $part -ForegroundColor $Color
+    }
+    $body=$body.Substring($take).TrimStart()
+  }
+}
+
 function Read-Events {
   if(-not (Test-Path -LiteralPath $EventLogPath)){ return @() }
 
-  $take=[Math]::Max(100,$MaxRows*8)
-  return @(Get-Content -LiteralPath $EventLogPath -Tail $take |
+  $take=[Math]::Max(100,$MaxRows*10)
+  $events=@(Get-Content -LiteralPath $EventLogPath -Tail $take |
     ForEach-Object {
       try { $_ | ConvertFrom-Json } catch { $null }
     } |
     Where-Object { $null -ne $_ })
+
+  # Once the new event format is present, hide legacy rows that had no
+  # activity id or request/result detail. The dashboard should show useful
+  # information, not historical noise.
+  if(@($events | Where-Object { $_.ActivityId }).Count -gt 0) {
+    $events=@($events | Where-Object { $_.ActivityId })
+  }
+  return $events
 }
 
 function Get-LatestOperations($Events) {
   if($Events.Count -eq 0){ return @() }
 
-  $indexed=@()
-  $legacy=0
-  foreach($event in $Events) {
-    $id=[string]$event.ActivityId
-    if([string]::IsNullOrWhiteSpace($id) -or $id -eq '0') {
-      $legacy++
-      $id="legacy-$legacy"
-    }
-
-    $indexed += [pscustomobject]@{
-      Key=$id
-      Event=$event
-    }
-  }
-
-  $latest=@($indexed |
-    Group-Object Key |
-    ForEach-Object { $_.Group[-1].Event } |
+  $latest=@($Events |
+    Group-Object ActivityId |
+    ForEach-Object { $_.Group[-1] } |
     Sort-Object { try { [DateTimeOffset]$_.Timestamp } catch { [DateTimeOffset]::MinValue } })
 
   if($latest.Count -gt $MaxRows) {
     return @($latest | Select-Object -Last $MaxRows)
   }
-
   return $latest
 }
 
@@ -126,7 +143,6 @@ while($true) {
   try {
     $width=[Math]::Max(100,[Math]::Min(180,$Host.UI.RawUI.WindowSize.Width))
   } catch {}
-  $detailWidth=[Math]::Max(24,$width-83)
 
   Clear-Host
   Write-Host ''
@@ -144,35 +160,36 @@ while($true) {
   Write-Host '   FAILED ' -ForegroundColor Gray -NoNewline
   Write-Host $failed -ForegroundColor $(if($failed -gt 0){'Red'}else{'Green'})
 
-  Write-Host (' Event log: {0}' -f (Clip $EventLogPath ($width-13))) -ForegroundColor DarkGray
+  Write-Host (' Event log: {0}' -f $EventLogPath) -ForegroundColor DarkGray
   Write-Rule $width '-' 'DarkGray'
 
+  Write-Host ' LAST MUTATION' -ForegroundColor Magenta
   if($lastMutation) {
-    Write-Host ' LAST MUTATION ' -ForegroundColor Black -BackgroundColor Magenta -NoNewline
-    Write-Host (' {0}  {1}  {2} ms  {3}' -f
+    Write-Host ('   {0}  {1}  {2} ms' -f
       (Get-StateBadge ([string]$lastMutation.State)),
       [string]$lastMutation.Operation,
-      [int64]$lastMutation.ElapsedMs,
-      (Clip ([string]$lastMutation.Detail) ($width-48))
+      [int64]$lastMutation.ElapsedMs
     ) -ForegroundColor (Get-StateColor ([string]$lastMutation.State))
+    Write-Detail 'WHAT:' ([string]$lastMutation.Detail) $width (Get-StateColor ([string]$lastMutation.State))
   } else {
-    Write-Host ' LAST MUTATION  none in current window' -ForegroundColor DarkGray
+    Write-Host '   none in current activity window' -ForegroundColor DarkGray
   }
 
+  Write-Host ' LAST FAILURE' -ForegroundColor Red
   if($lastFailure) {
-    Write-Host ' LAST FAILURE  ' -ForegroundColor Black -BackgroundColor Red -NoNewline
-    Write-Host (' {0}  {1}  {2}' -f
+    Write-Host ('   {0}  {1}  {2} ms' -f
+      (Get-StateBadge ([string]$lastFailure.State)),
       [string]$lastFailure.Operation,
-      ([int64]$lastFailure.ElapsedMs),
-      (Clip ([string]$lastFailure.Detail) ($width-38))
+      [int64]$lastFailure.ElapsedMs
     ) -ForegroundColor Red
+    Write-Detail 'WHY:' ([string]$lastFailure.Detail) $width Red
   } else {
-    Write-Host ' LAST FAILURE   none' -ForegroundColor Green
+    Write-Host '   none' -ForegroundColor Green
   }
 
   Write-Rule $width '-' 'DarkGray'
-  Write-Host (' {0,-6} {1,-13} {2,-9} {3,-9} {4,9}  {5,-25} {6}' -f
-    'ID','TIME','STATE','LANE','ELAPSED','ACTION','TARGET / RESULT') -ForegroundColor White
+  Write-Host (' {0,-7} {1,-13} {2,-10} {3,-9} {4,9}  {5}' -f
+    'ID','TIME','STATE','LANE','ELAPSED','ACTION') -ForegroundColor White
   Write-Rule $width '-' 'DarkGray'
 
   if($operations.Count -eq 0) {
@@ -181,20 +198,20 @@ while($true) {
   } else {
     foreach($event in $operations) {
       $time=try { ([DateTimeOffset]$event.Timestamp).ToLocalTime().ToString('HH:mm:ss.fff') } catch { '--:--:--.---' }
-      $id=if($event.ActivityId){'#'+[string]$event.ActivityId}else{'-'}
+      $id='#'+[string]$event.ActivityId
       $state=[string]$event.State
       $lane=[string]$event.Lane
       $badge=Get-StateBadge $state
       $elapsed=('{0} ms' -f [int64]$event.ElapsedMs)
-      $operation=Clip ([string]$event.Operation) 25
-      $detail=Clip ([string]$event.Detail) $detailWidth
+      $operation=[string]$event.Operation
+      $detail=[string]$event.Detail
 
-      Write-Host (' {0,-6} {1,-13} ' -f $id,$time) -ForegroundColor DarkGray -NoNewline
-      Write-Host ('{0,-9} ' -f $badge) -ForegroundColor (Get-StateColor $state) -NoNewline
+      Write-Host (' {0,-7} {1,-13} ' -f $id,$time) -ForegroundColor DarkGray -NoNewline
+      Write-Host ('{0,-10} ' -f $badge) -ForegroundColor (Get-StateColor $state) -NoNewline
       Write-Host ('{0,-9} ' -f $lane) -ForegroundColor (Get-LaneColor $lane) -NoNewline
       Write-Host ('{0,9}  ' -f $elapsed) -ForegroundColor White -NoNewline
-      Write-Host ('{0,-25} ' -f $operation) -ForegroundColor White -NoNewline
-      Write-Host $detail -ForegroundColor (Get-StateColor $state)
+      Write-Host $operation -ForegroundColor White
+      Write-Detail 'WHAT:' $detail $width (Get-StateColor $state)
     }
   }
 
