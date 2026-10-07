@@ -1,5 +1,6 @@
 using System.IO;
 using System.Text.Json;
+using System.Threading.Channels;
 using WindowsCommander.Core.Safety;
 
 namespace WindowsCommander.Safety.Audit;
@@ -14,12 +15,20 @@ public sealed class PersistentAuditLog : IAuditLog
         "command",
         "content",
         "environment",
-        "text",
-        "value"
+        "text"
+    };
+
+    private static readonly string[] SensitiveNameMarkers =
+    {
+        "password", "passwd", "token", "secret", "api_key", "apikey",
+        "private_key", "credential", "authorization", "connection_string"
     };
 
     private readonly object gate = new();
+    private readonly object persistenceGate = new();
     private readonly Queue<AuditEntry> entries = new();
+    private readonly Channel<AuditEntry> persistenceQueue;
+    private readonly Task persistenceWorker;
     private readonly int capacity;
     private readonly string path;
 
@@ -27,7 +36,15 @@ public sealed class PersistentAuditLog : IAuditLog
     {
         this.capacity = Math.Max(1, capacity);
         this.path = ResolvePath(path);
+        persistenceQueue = Channel.CreateBounded<AuditEntry>(new BoundedChannelOptions(Math.Max(256, this.capacity * 2))
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait
+        });
+
         LoadExisting();
+        persistenceWorker = Task.Run(PersistenceLoopAsync);
     }
 
     public string Path => path;
@@ -38,10 +55,55 @@ public sealed class PersistentAuditLog : IAuditLog
         {
             entries.Enqueue(entry);
             TrimToCapacity();
+        }
 
+        var persisted = entry with { RedactedArguments = Redact(entry.RedactedArguments) };
+
+        // High-risk mutations pay the small durability cost synchronously.
+        // Ordinary reads and medium-risk operations leave file I/O/compaction
+        // off the request hot path.
+        if (entry.Risk == RiskLevel.High)
+        {
+            PersistOne(persisted);
+            return;
+        }
+
+        if (!persistenceQueue.Writer.TryWrite(persisted))
+        {
+            // Backpressure must not silently lose audit evidence. A saturated
+            // queue falls back to synchronous persistence rather than dropping.
+            PersistOne(persisted);
+        }
+    }
+
+    public IReadOnlyList<AuditEntry> GetRecent(int limit, bool includeSensitiveArguments)
+    {
+        lock (gate)
+        {
+            return entries
+                .Reverse()
+                .Take(Math.Clamp(limit, 1, capacity))
+                .Select(entry => includeSensitiveArguments
+                    ? entry
+                    : entry with { RedactedArguments = Redact(entry.RedactedArguments) })
+                .ToArray();
+        }
+    }
+
+    private async Task PersistenceLoopAsync()
+    {
+        await foreach (var entry in persistenceQueue.Reader.ReadAllAsync())
+        {
+            PersistOne(entry);
+        }
+    }
+
+    private void PersistOne(AuditEntry persisted)
+    {
+        lock (persistenceGate)
+        {
             try
             {
-                var persisted = entry with { RedactedArguments = Redact(entry.RedactedArguments) };
                 var directory = System.IO.Path.GetDirectoryName(path);
                 if (!string.IsNullOrWhiteSpace(directory))
                 {
@@ -59,20 +121,6 @@ public sealed class PersistentAuditLog : IAuditLog
             {
                 Console.Error.WriteLine($"Failed to persist Windows Commander audit entry: {exception.Message}");
             }
-        }
-    }
-
-    public IReadOnlyList<AuditEntry> GetRecent(int limit, bool includeSensitiveArguments)
-    {
-        lock (gate)
-        {
-            return entries
-                .Reverse()
-                .Take(Math.Clamp(limit, 1, capacity))
-                .Select(entry => includeSensitiveArguments
-                    ? entry
-                    : entry with { RedactedArguments = Redact(entry.RedactedArguments) })
-                .ToArray();
         }
     }
 
@@ -112,6 +160,14 @@ public sealed class PersistentAuditLog : IAuditLog
 
     private void Compact()
     {
+        AuditEntry[] snapshot;
+        lock (gate)
+        {
+            snapshot = entries
+                .Select(entry => entry with { RedactedArguments = Redact(entry.RedactedArguments) })
+                .ToArray();
+        }
+
         var directory = System.IO.Path.GetDirectoryName(path);
         if (!string.IsNullOrWhiteSpace(directory))
         {
@@ -119,10 +175,7 @@ public sealed class PersistentAuditLog : IAuditLog
         }
 
         var tempPath = path + ".tmp";
-        var lines = entries
-            .Select(entry => entry with { RedactedArguments = Redact(entry.RedactedArguments) })
-            .Select(entry => JsonSerializer.Serialize(entry));
-
+        var lines = snapshot.Select(JsonSerializer.Serialize);
         File.WriteAllLines(tempPath, lines);
         File.Move(tempPath, path, overwrite: true);
     }
@@ -189,7 +242,7 @@ public sealed class PersistentAuditLog : IAuditLog
                 property => RedactValue(property.Name, property.Value),
                 StringComparer.OrdinalIgnoreCase),
             JsonValueKind.Array => element.EnumerateArray()
-                .Select(item => RedactJsonElement(item))
+                .Select(RedactJsonElement)
                 .ToArray(),
             JsonValueKind.String => element.GetString(),
             JsonValueKind.Number when element.TryGetInt64(out var integer) => integer,
@@ -203,10 +256,12 @@ public sealed class PersistentAuditLog : IAuditLog
 
     private static bool IsSensitive(string key)
     {
-        return AlwaysRedactedKeys.Contains(key)
-            || key.Contains("password", StringComparison.OrdinalIgnoreCase)
-            || key.Contains("token", StringComparison.OrdinalIgnoreCase)
-            || key.Contains("secret", StringComparison.OrdinalIgnoreCase)
-            || key.Contains("key", StringComparison.OrdinalIgnoreCase);
+        if (AlwaysRedactedKeys.Contains(key))
+        {
+            return true;
+        }
+
+        return SensitiveNameMarkers.Any(marker =>
+            key.Contains(marker, StringComparison.OrdinalIgnoreCase));
     }
 }
