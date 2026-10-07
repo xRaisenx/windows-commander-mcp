@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using WindowsCommander.Windows.Services;
 
 namespace WindowsCommander.Tests;
@@ -73,6 +74,7 @@ public class ExecutionServiceCancellationTests
     public async Task ExecuteProcessAsync_ParentExitDoesNotWaitForDetachedChildHoldingPipes()
     {
         var service = new ExecutionService();
+        var stopwatch = Stopwatch.StartNew();
         var result = await service.ExecuteProcessAsync(
             "pwsh.exe",
             new[]
@@ -87,14 +89,15 @@ public class ExecutionServiceCancellationTests
             timeoutMs: 10000,
             waitForExit: true,
             CancellationToken.None);
+        stopwatch.Stop();
 
         Assert.Equal(0, result.ExitCode);
         Assert.False(result.TimedOut);
         Assert.Contains("parent-done", result.StandardOutput, StringComparison.OrdinalIgnoreCase);
         Assert.NotNull(result.ElapsedTime);
         Assert.True(
-            result.ElapsedTime < TimeSpan.FromSeconds(3),
-            $"Expected the direct parent result without waiting for the detached child; elapsed={result.ElapsedTime}.");
+            stopwatch.Elapsed < TimeSpan.FromSeconds(3),
+            $"Expected the await itself to complete without waiting for the detached child; elapsed={stopwatch.Elapsed}.");
     }
 
 }

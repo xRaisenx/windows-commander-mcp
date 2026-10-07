@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.IO;
 using System.Text;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Services;
@@ -9,7 +8,6 @@ namespace WindowsCommander.Windows.Services;
 public sealed class ExecutionService : IExecutionService
 {
     private static readonly TimeSpan OutputDrainGrace = TimeSpan.FromSeconds(1);
-    private static readonly TimeSpan OutputDrainCancelGrace = TimeSpan.FromMilliseconds(250);
     public async Task<CommandExecutionResult> ExecutePowerShellAsync(
         string command,
         string? workingDirectory,
@@ -91,25 +89,54 @@ public sealed class ExecutionService : IExecutionService
         using var process = StartProcess(executablePath, arguments, workingDirectory, environment, redirectOutput: true);
         var processId = process.Id;
 
-        // Read both pipes continuously while the direct child runs. A detached
+        // Read both pipes asynchronously while the direct child runs. A detached
         // descendant may inherit those handles and keep them open after the
         // direct child exits, so pipe EOF must never become an unbounded part
         // of request completion.
-        using var drainSource = new CancellationTokenSource();
         var stdoutBuffer = new StringBuilder();
         var stderrBuffer = new StringBuilder();
-        var stdoutTask = DrainAsync(process.StandardOutput, stdoutBuffer, drainSource.Token);
-        var stderrTask = DrainAsync(process.StandardError, stderrBuffer, drainSource.Token);
+        var stdoutCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stderrCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        process.OutputDataReceived += (_, eventArgs) =>
+        {
+            if (eventArgs.Data is null)
+            {
+                stdoutCompleted.TrySetResult(true);
+                return;
+            }
+
+            lock (stdoutBuffer)
+            {
+                stdoutBuffer.AppendLine(eventArgs.Data);
+            }
+        };
+        process.ErrorDataReceived += (_, eventArgs) =>
+        {
+            if (eventArgs.Data is null)
+            {
+                stderrCompleted.TrySetResult(true);
+                return;
+            }
+
+            lock (stderrBuffer)
+            {
+                stderrBuffer.AppendLine(eventArgs.Data);
+            }
+        };
+
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
 
         try
         {
-            await process.WaitForExitAsync(linkedSource.Token);
+            await WaitForDirectProcessExitAsync(process, linkedSource.Token);
             var (stdout, stderr) = await CompleteOutputCaptureAsync(
-                stdoutTask,
-                stderrTask,
+                process,
+                stdoutCompleted.Task,
+                stderrCompleted.Task,
                 stdoutBuffer,
-                stderrBuffer,
-                drainSource);
+                stderrBuffer);
             stopwatch.Stop();
 
             return new CapturedExecution(
@@ -121,11 +148,11 @@ public sealed class ExecutionService : IExecutionService
             TryKill(process);
             await WaitForKilledProcessAsync(process);
             var (stdout, stderr) = await CompleteOutputCaptureAsync(
-                stdoutTask,
-                stderrTask,
+                process,
+                stdoutCompleted.Task,
+                stderrCompleted.Task,
                 stdoutBuffer,
-                stderrBuffer,
-                drainSource);
+                stderrBuffer);
             stopwatch.Stop();
 
             var timeoutMessage = string.IsNullOrWhiteSpace(stderr)
@@ -141,81 +168,56 @@ public sealed class ExecutionService : IExecutionService
             TryKill(process);
             await WaitForKilledProcessAsync(process);
             _ = await CompleteOutputCaptureAsync(
-                stdoutTask,
-                stderrTask,
+                process,
+                stdoutCompleted.Task,
+                stderrCompleted.Task,
                 stdoutBuffer,
-                stderrBuffer,
-                drainSource);
+                stderrBuffer);
             stopwatch.Stop();
             throw;
         }
     }
 
-    private static async Task DrainAsync(
-        StreamReader reader,
-        StringBuilder destination,
-        CancellationToken cancellationToken)
+    private static async Task<(string Stdout, string Stderr)> CompleteOutputCaptureAsync(
+        Process process,
+        Task stdoutCompleted,
+        Task stderrCompleted,
+        StringBuilder stdoutBuffer,
+        StringBuilder stderrBuffer)
     {
-        var buffer = new char[4096];
-
         try
         {
-            while (true)
-            {
-                var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken);
-                if (read == 0)
-                {
-                    return;
-                }
+            await Task.WhenAll(stdoutCompleted, stderrCompleted).WaitAsync(OutputDrainGrace);
+        }
+        catch (TimeoutException)
+        {
+            TryCancelOutputRead(process);
+            TryCancelErrorRead(process);
+        }
 
-                lock (destination)
-                {
-                    destination.Append(buffer, 0, read);
-                }
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        return (Snapshot(stdoutBuffer), Snapshot(stderrBuffer));
+    }
+
+    private static void TryCancelOutputRead(Process process)
+    {
+        try
         {
+            process.CancelOutputRead();
         }
-        catch (ObjectDisposedException)
-        {
-        }
-        catch (IOException)
+        catch (InvalidOperationException)
         {
         }
     }
 
-    private static async Task<(string Stdout, string Stderr)> CompleteOutputCaptureAsync(
-        Task stdoutTask,
-        Task stderrTask,
-        StringBuilder stdoutBuffer,
-        StringBuilder stderrBuffer,
-        CancellationTokenSource drainSource)
+    private static void TryCancelErrorRead(Process process)
     {
-        var drains = Task.WhenAll(stdoutTask, stderrTask);
-
         try
         {
-            await drains.WaitAsync(OutputDrainGrace);
+            process.CancelErrorRead();
         }
-        catch (TimeoutException)
+        catch (InvalidOperationException)
         {
-            drainSource.Cancel();
-
-            try
-            {
-                await drains.WaitAsync(OutputDrainCancelGrace);
-            }
-            catch (TimeoutException)
-            {
-                // A detached descendant can keep inherited stdout/stderr handles
-                // open even after cancellation. The direct process result is
-                // already terminal, so return the captured prefix instead of
-                // keeping the MCP request active indefinitely.
-            }
         }
-
-        return (Snapshot(stdoutBuffer), Snapshot(stderrBuffer));
     }
 
     private static string Snapshot(StringBuilder buffer)
@@ -267,12 +269,42 @@ public sealed class ExecutionService : IExecutionService
         return Process.Start(startInfo) ?? throw new InvalidOperationException($"Failed to start process: {executablePath}");
     }
 
+    private static async Task WaitForDirectProcessExitAsync(
+        Process process,
+        CancellationToken cancellationToken)
+    {
+        if (process.HasExited)
+        {
+            return;
+        }
+
+        var exited = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        void OnExited(object? sender, EventArgs eventArgs) => exited.TrySetResult(true);
+
+        process.Exited += OnExited;
+        process.EnableRaisingEvents = true;
+
+        try
+        {
+            if (process.HasExited)
+            {
+                return;
+            }
+
+            await exited.Task.WaitAsync(cancellationToken);
+        }
+        finally
+        {
+            process.Exited -= OnExited;
+        }
+    }
+
     private static async Task WaitForKilledProcessAsync(Process process)
     {
         try
         {
             using var settle = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            await process.WaitForExitAsync(settle.Token);
+            await WaitForDirectProcessExitAsync(process, settle.Token);
         }
         catch (OperationCanceledException)
         {
