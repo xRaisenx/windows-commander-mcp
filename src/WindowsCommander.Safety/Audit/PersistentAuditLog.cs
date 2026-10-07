@@ -15,7 +15,8 @@ public sealed class PersistentAuditLog : IAuditLog
         "command",
         "content",
         "environment",
-        "text"
+        "text",
+        "value"
     };
 
     private static readonly string[] SensitiveNameMarkers =
@@ -175,7 +176,7 @@ public sealed class PersistentAuditLog : IAuditLog
         }
 
         var tempPath = path + ".tmp";
-        var lines = snapshot.Select(JsonSerializer.Serialize);
+        var lines = snapshot.Select(entry => JsonSerializer.Serialize(entry));
         File.WriteAllLines(tempPath, lines);
         File.Move(tempPath, path, overwrite: true);
     }
