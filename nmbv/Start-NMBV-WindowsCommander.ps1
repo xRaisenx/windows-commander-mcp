@@ -110,22 +110,52 @@ function Stop-UnmanagedRawProfileOwners {
   $alias=[regex]::Escape([string]$cfg.alias)
   $configuredExe=[IO.Path]::GetFullPath([string]$cfg.tunnelClientPath).Replace('/','\')
 
-  $matches=Get-CimInstance Win32_Process -Filter "Name='tunnel-client.exe'" -ErrorAction SilentlyContinue |
-    Where-Object {
-      $commandLine=[string]$_.CommandLine
-      $executablePath=[string]$_.ExecutablePath
-      if([string]::IsNullOrWhiteSpace($commandLine) -or [string]::IsNullOrWhiteSpace($executablePath)){return $false}
+  function Get-RawOwners {
+    @(Get-CimInstance Win32_Process -Filter "Name='tunnel-client.exe'" -ErrorAction SilentlyContinue |
+      Where-Object {
+        $commandLine=[string]$_.CommandLine
+        $executablePath=[string]$_.ExecutablePath
+        if([string]::IsNullOrWhiteSpace($commandLine) -or [string]::IsNullOrWhiteSpace($executablePath)){return $false}
 
-      $sameExecutable=[IO.Path]::GetFullPath($executablePath).Replace('/','\').Equals(
-        $configuredExe,
-        [StringComparison]::OrdinalIgnoreCase)
-      $isRawProfile=$commandLine -match "(?i)\brun\s+--profile\s+[`"']?$alias[`"']?(?:\s|$)"
-      $isManaged=$commandLine -match '(?i)\brun\s+--profile-dir\b'
-      return $sameExecutable -and $isRawProfile -and -not $isManaged
+        $sameExecutable=[IO.Path]::GetFullPath($executablePath).Replace('/','\').Equals(
+          $configuredExe,
+          [StringComparison]::OrdinalIgnoreCase)
+        $isRawProfile=$commandLine -match "(?i)\brun\s+--profile\s+[`"']?$alias[`"']?(?:\s|$)"
+        $isManaged=$commandLine -match '(?i)\brun\s+--profile-dir\b'
+        return $sameExecutable -and $isRawProfile -and -not $isManaged
+      })
+  }
+
+  $owners=Get-RawOwners
+  if($owners.Count -eq 0){return}
+
+  $watchdogParents=@($owners | ForEach-Object { [int]$_.ParentProcessId } | Sort-Object -Unique)
+  foreach($process in $owners){
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+
+  Start-Sleep -Milliseconds 350
+  $respawned=Get-RawOwners
+  if($respawned.Count -gt 0){
+    foreach($process in $respawned){
+      $parentId=[int]$process.ParentProcessId
+      if($watchdogParents -contains $parentId){
+        $parent=Get-CimInstance Win32_Process -Filter "ProcessId=$parentId" -ErrorAction SilentlyContinue
+        $parentName=[string]$parent.Name
+        if($parentName -in @('cmd.exe','powershell.exe','pwsh.exe')){
+          Stop-Process -Id $parentId -Force -ErrorAction SilentlyContinue
+        }
+      }
+      Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
     }
 
-  foreach($process in $matches) {
-    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 350
+  }
+
+  $remaining=Get-RawOwners
+  if($remaining.Count -gt 0){
+    $pids=($remaining | ForEach-Object { $_.ProcessId }) -join ','
+    throw "Unable to retire raw Windows Commander profile owner(s): $pids"
   }
 }
 
