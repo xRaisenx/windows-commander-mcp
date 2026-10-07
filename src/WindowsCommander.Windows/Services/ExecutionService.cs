@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using WindowsCommander.Core.Models;
 using WindowsCommander.Core.Services;
+using WindowsCommander.McpServer.Mcp;
 
 namespace WindowsCommander.Windows.Services;
 
@@ -157,8 +158,13 @@ public sealed class ExecutionService : IExecutionService
             startInfo.WorkingDirectory = workingDirectory;
         }
 
+        _ = EnvironmentSanitizer.ApplyTo(startInfo);
+
         if (environment is not null)
         {
+            // Explicit per-call environment values are deliberate and may
+            // re-introduce credentials after the inherited environment was
+            // scrubbed.
             foreach (var pair in environment)
             {
                 startInfo.Environment[pair.Key] = pair.Value;
