@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -7,7 +8,7 @@ using WindowsCommander.Safety.Audit;
 using WindowsCommander.Safety.Policy;
 using WindowsCommander.Windows.Services;
 
-_ = EnvironmentSanitizer.ScrubCurrentProcess();
+var scrubbedEnvironmentVariables = EnvironmentSanitizer.ScrubCurrentProcess();
 using var instanceGuard = InstanceGuard.Acquire();
 
 var requireConfirmation = !IsUnattended();
@@ -26,6 +27,17 @@ var maxRequestBytes = GetBoundedEnvironmentInt(
     defaultValue: 1024 * 1024,
     minimum: 64 * 1024,
     maximum: 8 * 1024 * 1024);
+
+var rescueConsole = new RescueConsole();
+var serverUptime = Stopwatch.StartNew();
+Func<object> runtimeStatusProvider = () => CreateRuntimeStatus(
+    rescueConsole,
+    serverUptime,
+    maxConcurrency,
+    requestTimeoutMs,
+    maxRequestBytes,
+    requireConfirmation,
+    scrubbedEnvironmentVariables.Count);
 
 var dispatcher = new ToolDispatcher(
     new ProcessService(),
@@ -46,9 +58,8 @@ var dispatcher = new ToolDispatcher(
     new ControlIndicatorService(),
     new PersistentAuditLog(),
     new RiskPolicyService(),
-    requireConfirmation);
-
-var rescueConsole = new RescueConsole();
+    requireConfirmation,
+    runtimeStatusProvider);
 using var globalConcurrency = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 using var desktopLane = new SemaphoreSlim(1, 1);
 using var processLane = new SemaphoreSlim(Math.Min(2, maxConcurrency), Math.Min(2, maxConcurrency));
@@ -84,6 +95,15 @@ while (await input.ReadLineAsync() is { } line)
         continue;
     }
 
+    // Keep rescue/status visibility available even when all normal execution
+    // slots are occupied by slow operations.
+    var fastStatus = TryCreateRuntimeStatusResponse(line, runtimeStatusProvider);
+    if (fastStatus is not null)
+    {
+        await responses.Writer.WriteAsync(fastStatus);
+        continue;
+    }
+
     await globalConcurrency.WaitAsync();
     inFlight.RemoveAll(static task => task.IsCompleted);
 
@@ -114,6 +134,81 @@ while (await input.ReadLineAsync() is { } line)
 await Task.WhenAll(inFlight);
 responses.Writer.TryComplete();
 await writerTask;
+
+static JsonRpcResponse? TryCreateRuntimeStatusResponse(string line, Func<object> runtimeStatusProvider)
+{
+    try
+    {
+        using var document = JsonDocument.Parse(line);
+        var root = document.RootElement;
+        if (!root.TryGetProperty("method", out var method)
+            || !string.Equals(method.GetString(), "tools/call", StringComparison.Ordinal)
+            || !root.TryGetProperty("params", out var parameters)
+            || !parameters.TryGetProperty("name", out var name)
+            || !string.Equals(name.GetString(), "get_runtime_status", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        if (!root.TryGetProperty("id", out var id))
+        {
+            return null;
+        }
+
+        return JsonRpcResponse.Success(id.Clone(), runtimeStatusProvider());
+    }
+    catch (JsonException)
+    {
+        // Let the normal parser return the protocol error.
+        return null;
+    }
+}
+
+static object CreateRuntimeStatus(
+    RescueConsole rescueConsole,
+    Stopwatch serverUptime,
+    int maxConcurrency,
+    int requestTimeoutMs,
+    int maxRequestBytes,
+    bool requireConfirmation,
+    int scrubbedEnvironmentVariableCount)
+{
+    int? sessionId = null;
+    try
+    {
+        using var process = Process.GetCurrentProcess();
+        sessionId = process.SessionId;
+    }
+    catch
+    {
+        // Session identity can be unavailable in constrained hosts.
+    }
+
+    return new
+    {
+        healthy = true,
+        server = ServerInfo.Name,
+        version = ServerInfo.Version,
+        informational_version = ServerInfo.InformationalVersion,
+        source_revision = ServerInfo.SourceRevision,
+        executable_sha256 = ServerInfo.ExecutableSha256,
+        process_id = Environment.ProcessId,
+        process_started_at = ServerInfo.ProcessStartedAt,
+        uptime_ms = serverUptime.ElapsedMilliseconds,
+        process_session_id = sessionId,
+        user_interactive = Environment.UserInteractive,
+        instance_key = Environment.GetEnvironmentVariable("WINDOWS_COMMANDER_INSTANCE_KEY") ?? "default",
+        confirmation_policy = requireConfirmation ? "local-confirmation-for-high-risk" : "unattended",
+        max_concurrency = maxConcurrency,
+        desktop_lane_limit = 1,
+        process_lane_limit = Math.Min(2, maxConcurrency),
+        request_timeout_ms = requestTimeoutMs,
+        max_request_bytes = maxRequestBytes,
+        stdout_protocol_only = true,
+        scrubbed_environment_variable_count = scrubbedEnvironmentVariableCount,
+        scheduler = rescueConsole.Snapshot()
+    };
+}
 
 static async Task WriteResponsesAsync(ChannelReader<JsonRpcResponse> reader, StreamWriter output)
 {
