@@ -186,6 +186,7 @@ static object CreateRuntimeStatus(
         informational_version = ServerInfo.InformationalVersion,
         source_revision = ServerInfo.SourceRevision,
         executable_sha256 = ServerInfo.ExecutableSha256,
+        assembly_sha256 = ServerInfo.AssemblySha256,
         process_id = Environment.ProcessId,
         process_started_at = ServerInfo.ProcessStartedAt,
         uptime_ms = serverUptime.ElapsedMilliseconds,
