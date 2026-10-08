@@ -181,13 +181,18 @@ public sealed class CodeIntelManager : IAsyncDisposable
             cancellationToken);
 
         var count = references.ValueKind == JsonValueKind.Array ? references.GetArrayLength() : 0;
+        // LSP reference search is not an index-completeness certificate. An
+        // unopened importing module can be omitted, producing a false zero.
+        // Fail closed until a separately proven complete graph is available.
         return new
         {
             session_id = session.Id,
             document_path = document.Path,
             document_sha256 = document.Sha256,
             reference_count = count,
-            safe_to_delete = count == 0,
+            reference_index_complete = false,
+            safe_to_delete = false,
+            reason = "LSP references do not prove all workspace files were indexed",
             references
         };
     }
