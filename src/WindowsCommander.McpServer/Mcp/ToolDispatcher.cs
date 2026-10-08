@@ -564,7 +564,7 @@ public sealed class ToolDispatcher
         await Task.Delay(CaptureForegroundSettleMs, cancellationToken);
     }
 
-    private static object ToToolResult(object result)
+    internal static object ToToolResult(object result)
     {
         // Screenshots are returned as MCP image content so clients can view the
         // PNG directly, instead of an unusable multi-megabyte base64 text blob.

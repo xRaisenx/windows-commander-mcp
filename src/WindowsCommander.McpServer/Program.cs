@@ -150,7 +150,7 @@ static JsonRpcResponse? TryCreateRuntimeStatusResponse(string line, Func<object>
             return null;
         }
 
-        return JsonRpcResponse.Success(id.Clone(), runtimeStatusProvider());
+        return JsonRpcResponse.Success(id.Clone(), ToolDispatcher.ToToolResult(runtimeStatusProvider()));
     }
     catch (JsonException)
     {
