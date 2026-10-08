@@ -36,6 +36,16 @@ public class ServerInfoTests
     }
 
     [Fact]
+    public void AssemblySha256_IdentifiesActualLoadedManagedCode()
+    {
+        var assemblyFile = typeof(ServerInfo).Assembly.Location;
+        Assert.False(string.IsNullOrEmpty(assemblyFile));
+        using var stream = System.IO.File.OpenRead(assemblyFile);
+        var expected = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream));
+        Assert.Equal(expected, ServerInfo.AssemblySha256);
+    }
+
+    [Fact]
     public void Version_IsNonEmpty()
     {
         Assert.False(string.IsNullOrWhiteSpace(ServerInfo.Version));
