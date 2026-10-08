@@ -21,7 +21,9 @@ public static class ServerInfo
 
     public static string? SourceRevision { get; } = ResolveSourceRevision();
 
-    public static string? ExecutableSha256 { get; } = ResolveExecutableSha256();
+    public static string? ExecutableSha256 { get; } = ResolveFileSha256(Environment.ProcessPath);
+
+    public static string? AssemblySha256 { get; } = ResolveFileSha256(ExecutingAssembly.Location);
 
     public static DateTimeOffset ProcessStartedAt { get; } = ResolveProcessStart();
 
@@ -56,9 +58,8 @@ public static class ServerInfo
             : null;
     }
 
-    private static string? ResolveExecutableSha256()
+    private static string? ResolveFileSha256(string? path)
     {
-        var path = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
         {
             return null;
