@@ -119,7 +119,18 @@ public sealed class ProcessOperationSupervisor
             try
             {
                 await process.WaitForExitAsync(linked.Token);
-                await Task.WhenAll(stdoutTask, stderrTask);
+                // Descendants may inherit stdout/stderr handles even after the tracked
+                // launcher exits. Preserve a short output-drain window without leaving
+                // the launcher operation RUNNING until a descendant shuts down.
+                try
+                {
+                    await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(TimeSpan.FromSeconds(2));
+                }
+                catch (TimeoutException)
+                {
+                    // The launcher's exit status is authoritative; inherited pipes
+                    // must not postpone its terminal state indefinitely.
+                }
                 operation.MarkCompleted(process.ExitCode);
             }
             catch (OperationCanceledException) when (operation.CancellationToken.IsCancellationRequested)
