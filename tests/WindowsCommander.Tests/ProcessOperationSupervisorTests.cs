@@ -74,6 +74,30 @@ public class ProcessOperationSupervisorTests
         _ = await WaitForTerminalAsync(supervisor, first.OperationId);
     }
 
+    [Fact]
+    public async Task LauncherExit_CompletesWhileDescendantHoldsOutputPipes()
+    {
+        var supervisor = new ProcessOperationSupervisor(maxConcurrentProcesses: 1);
+        var started = supervisor.Start(
+            "pwsh.exe",
+            new[]
+            {
+                "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                "$child = Start-Process -FilePath 'pwsh.exe' -ArgumentList '-NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 8' -NoNewWindow -PassThru; Write-Output ('child=' + $child.Id); exit 0"
+            },
+            workingDirectory: null,
+            timeoutMs: 12000,
+            maxOutputBytes: 64 * 1024);
+
+        // The launcher has exited while its child still inherits the pipes.
+        // The tracked operation must not wait for the independently running child.
+        var completed = await WaitForTerminalAsync(supervisor, started.OperationId);
+        Assert.Equal("SUCCEEDED", completed.State);
+        Assert.Equal(0, completed.ExitCode);
+        Assert.Contains("child=", completed.StandardOutput);
+        Assert.True(completed.ElapsedMs < 5000, $"Launcher took {completed.ElapsedMs} ms to complete.");
+    }
+
     private static async Task<ManagedOperationSnapshot> WaitForTerminalAsync(
         ProcessOperationSupervisor supervisor,
         string operationId)
